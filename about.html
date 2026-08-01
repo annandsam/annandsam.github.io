@@ -789,53 +789,27 @@ function onTouchUp(id){
   ts.released=true;
 }
 
-if(window.PointerEvent&&isTouchDevice){
-  evEl.addEventListener('pointerdown',e=>{
-    if(e.pointerType==='mouse') return;
-    e.preventDefault();
-    const p=toCanvas(e.clientX,e.clientY);
-    onTouchDown(e.pointerId,p.x,p.y);
-    try{evEl.setPointerCapture(e.pointerId);}catch(err){}
-  },{passive:false});
-  evEl.addEventListener('pointermove',e=>{
-    if(e.pointerType==='mouse') return;
-    e.preventDefault();
-    const p=toCanvas(e.clientX,e.clientY);
-    onTouchMove(e.pointerId,p.x,p.y);
-  },{passive:false});
-  evEl.addEventListener('pointerup',e=>{
-    if(e.pointerType==='mouse') return;
-    e.preventDefault();
-    onTouchUp(e.pointerId);
-  },{passive:false});
-  evEl.addEventListener('pointercancel',e=>{
-    if(tTouches[e.pointerId]) tTouches[e.pointerId].released=true;
-  },{passive:false});
-} else {
-  evEl.addEventListener('touchstart',e=>{
-    e.preventDefault();
-    for(const t of e.changedTouches){
-      const p=toCanvas(t.clientX,t.clientY);
-      onTouchDown(t.identifier,p.x,p.y);
-    }
-  },{passive:false});
-  evEl.addEventListener('touchmove',e=>{
-    e.preventDefault();
-    for(const t of e.changedTouches){
-      const p=toCanvas(t.clientX,t.clientY);
-      onTouchMove(t.identifier,p.x,p.y);
-    }
-  },{passive:false});
-  evEl.addEventListener('touchend',e=>{
-    e.preventDefault();
-    for(const t of e.changedTouches) onTouchUp(t.identifier);
-  },{passive:false});
-  evEl.addEventListener('touchcancel',e=>{
-    for(const t of e.changedTouches){
-      if(tTouches[t.identifier]) tTouches[t.identifier].released=true;
-    }
-  },{passive:false});
-}
+// Passive touch listeners: unlike pointer events, these keep firing all the
+// way through a pan-y scroll, so the droplet stays pressed and stretches with
+// the finger instead of being cut off by pointercancel when scrolling starts.
+evEl.addEventListener('touchstart',e=>{
+  for(const t of e.changedTouches){
+    const p=toCanvas(t.clientX,t.clientY);
+    onTouchDown(t.identifier,p.x,p.y);
+  }
+},{passive:true});
+evEl.addEventListener('touchmove',e=>{
+  for(const t of e.changedTouches){
+    const p=toCanvas(t.clientX,t.clientY);
+    onTouchMove(t.identifier,p.x,p.y);
+  }
+},{passive:true});
+evEl.addEventListener('touchend',e=>{
+  for(const t of e.changedTouches) onTouchUp(t.identifier);
+},{passive:true});
+evEl.addEventListener('touchcancel',e=>{
+  for(const t of e.changedTouches) onTouchUp(t.identifier);
+},{passive:true});
 
 window.addEventListener('resize',resize);
 window.addEventListener('orientationchange',()=>{setTimeout(resize,100);});
