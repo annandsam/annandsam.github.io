@@ -410,7 +410,22 @@ nav.nav-open .nav-hamburger span:nth-child(3) { transform: translateY(-7px) rota
 </style>
 
 <style>
-.page-content, .page-content * { -webkit-touch-callout: none; }
+/* The plate is a toy you drag on, so a stir or a press must never start a
+   text selection or raise the iOS callout — the touch fix about.html uses.
+   Anything the visitor actually types stays selectable, and pan-y keeps the
+   browser's own vertical scrolling on the compositor. */
+.page-content { touch-action: pan-y; }
+.page-content, .page-content * {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  user-select: none;
+}
+.page-content input, .page-content textarea {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+}
 </style>
 </head>
 <body>
@@ -820,7 +835,7 @@ void main(){
   float lum = max(max(col.r, col.g), col.b);
   col = mix(col, vec3(1.0, 0.968, 0.90) * lum, smoothstep(0.75, 1.0, lum) * 0.55);
   vec2 vp = (vUv - 0.5 + vec2(0.02, -0.015)) * vec2(uWorld.x / uWorld.y, 1.0);
-  col *= 1.0 - 0.34 * smoothstep(0.34, 1.1, length(vp));
+  col *= 1.0 - 0.15 * smoothstep(0.34, 1.1, length(vp));
   vec2 gp = floor(gl_FragCoord.xy / (uDpr * 1.6));
   float gn = h21(gp + fract(uSeedT * 0.7107) * 61.0) - 0.5;
   col += gn * uGrain;
@@ -989,17 +1004,17 @@ function resize(){
 /* ══ DYE PALETTES ══════════════════════════════════════════════════════ */
 
 const PALETTES = [
-  /* the page's own shader colours, weighted toward its red: burnt orange
-     #c4501a (the frame), red #b42c1e, amber #c8950e, and an oxblood in
-     place of the neutral deep brown so the darkest ink reads red too */
+  /* the page's own four colours: burnt orange, brick red, gold and dark
+     chocolate — brown and red taken deeper, the orange more saturated and
+     the gold less creamy. Variants shift value, not hue */
   {name:'terracotta',
-   ab:[[0.21, 0.61, 0.67], [0.32, 0.97, 0.71], [0.16, 0.14, 0.65], [0.82, 1.26, 1.03]]},
+   ab:[[0.06, 0.43, 0.54], [0.44, 1.06, 0.81], [0.11, 0.06, 0.43], [1.37, 1.41, 1.38]]},
   {name:'kiln',
-   ab:[[0.40, 0.81, 0.85], [0.57, 1.13, 0.90], [0.27, 0.24, 0.77], [1.11, 1.63, 1.47]]},
+   ab:[[0.19, 0.53, 0.65], [0.56, 1.17, 0.93], [0.23, 0.16, 0.52], [1.55, 1.62, 1.53]]},
   {name:'ember',
-   ab:[[0.10, 0.41, 0.55], [0.24, 0.86, 0.69], [0.16, 0.14, 0.65], [0.71, 1.15, 0.97]]},
+   ab:[[0.02, 0.35, 0.45], [0.36, 0.96, 0.75], [0.04, 0.02, 0.30], [1.22, 1.25, 1.17]]},
   {name:'oxide',
-   ab:[[0.32, 0.60, 0.95], [0.46, 1.10, 0.85], [0.03, 0.03, 0.40], [1.25, 1.69, 1.56]]}
+   ab:[[0.13, 0.48, 0.59], [0.50, 1.11, 0.87], [0.17, 0.11, 0.44], [1.46, 1.50, 1.49]]}
 ];
 let palI = 0, palSrc = PALETTES[0].ab, palDst = PALETTES[0].ab, palT = 1, palNext = 16;
 function ss(x){ return x * x * (3 - 2 * x); }
@@ -1254,7 +1269,7 @@ function render(){
   gl.uniform1f(progComp.u.uGrain, 0.016);
   gl.uniform1f(progComp.u.uSeedT, Math.floor(t * 24) % 4096);
   gl.uniform1f(progComp.u.uDpr, DPR);
-  gl.uniform1f(progComp.u.uHot, 0.52);
+  gl.uniform1f(progComp.u.uHot, 0.24);
   bindTex(0, PHI8.t, progComp.u.uPhi8);
   bindTex(1, D[dCur].t, progComp.u.uDye);
   fullQuad();
@@ -1282,7 +1297,7 @@ function toWorld(cx, cy){
           inside: cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom};
 }
 function hits(el, sel){ return !!(el && el.closest && el.closest(sel)); }
-const FIELD = 'input, textarea, select, label';
+const FIELD = 'input, textarea, select, label, button';
 const LINKY = 'a, button, input, textarea, select, label';
 
 let pLastX = 0, pLastY = 0, pLastT = 0, pSeen = false;
@@ -1359,12 +1374,19 @@ function onUp(id, cx, cy, target, stamp){
 }
 
 if (window.PointerEvent){
-  window.addEventListener('pointerdown', e => onDown(e.pointerId, e.clientX, e.clientY, e.target, e.timeStamp), {passive:true});
+  window.addEventListener('pointerdown', e => {
+    onDown(e.pointerId, e.clientX, e.clientY, e.target, e.timeStamp);
+    if (e.pointerType === 'mouse' && toWorld(e.clientX, e.clientY).inside && !hits(e.target, FIELD))
+      e.preventDefault();
+  }, {passive:false});
   window.addEventListener('pointermove', e => onMove(e.pointerId, e.clientX, e.clientY), {passive:true});
   window.addEventListener('pointerup', e => onUp(e.pointerId, e.clientX, e.clientY, e.target, e.timeStamp), {passive:true});
   window.addEventListener('pointercancel', e => { pDown = false; pId = null; pHolding = false; imps[0].hold = false; }, {passive:true});
 } else {
-  window.addEventListener('mousedown', e => onDown('m', e.clientX, e.clientY, e.target, e.timeStamp));
+  window.addEventListener('mousedown', e => {
+    onDown('m', e.clientX, e.clientY, e.target, e.timeStamp);
+    if (toWorld(e.clientX, e.clientY).inside && !hits(e.target, FIELD)) e.preventDefault();
+  });
   window.addEventListener('mousemove', e => onMove('m', e.clientX, e.clientY));
   window.addEventListener('mouseup', e => onUp('m', e.clientX, e.clientY, e.target, e.timeStamp));
   window.addEventListener('touchstart', e => {
