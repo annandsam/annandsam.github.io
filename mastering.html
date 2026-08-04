@@ -310,6 +310,10 @@
 .album-title{color:#b0cba8 !important;}
 .rate-btn:hover{background:#143e1a !important;color:#ffffff !important;}
 </style>
+
+<style>
+.page-content, .page-content * { -webkit-touch-callout: none; }
+</style>
 </head>
 <body>
 
@@ -620,203 +624,955 @@
 </div>
 
 <script>
-(function() {
-  var canvas = document.getElementById('marble-canvas');
-  if (!canvas) return;
-  var gl = canvas.getContext('webgl', { alpha: false, antialias: false })
-         || canvas.getContext('experimental-webgl', { alpha: false });
-  if (!gl) return;
+/* Liquid Light IV — background adaptation (mastering variant).
+   Same simulation as liquidlight4.html, sized to the page-content panel.
+   Interaction is hover-stir only (drops/press/fullscreen removed so the form
+   stays fully usable); the autopilot supplies dye drops and glass presses. */
+(function(){
+'use strict';
 
-  function resize() {
-    var p   = canvas.parentElement;
-    var dpr = window.devicePixelRatio || 1;
-    var w   = p.clientWidth;
-    var h   = p.clientHeight;
-    canvas.width  = w * dpr;
-    canvas.height = h * dpr;
-    canvas.style.width  = w + 'px';
-    canvas.style.height = h + 'px';
+const cv = document.getElementById('marble-canvas');
+if (!cv) return;
+const host = cv.parentElement;
+const gl = cv.getContext('webgl', {alpha:false, antialias:false, depth:false, stencil:false,
+                                   preserveDrawingBuffer:false});
+if (!gl) return;   // panel keeps its dark background colour
+const reduceQ = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+const reduced = !!(reduceQ && reduceQ.matches);
+const TAU = Math.PI * 2;
+
+/* ══ SHADERS ═══════════════════════════════════════════════════════════ */
+
+const PREC = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+`;
+
+const VS_QUAD = `
+attribute vec2 a;
+varying vec2 vUv;
+void main(){ gl_Position = vec4(a, 0.0, 1.0); vUv = a * 0.5 + 0.5; }`;
+
+/* phi is packed 16-bit across R(hi)/G(lo): 8-bit phase fields band and stall */
+const PACK = `
+float unpk(vec4 t){ return (t.r * 65280.0 + t.g * 255.0) / 65535.0; }
+vec4 pk(float v){
+  v = clamp(v, 0.0, 1.0);
+  float x = floor(v * 65535.0 + 0.5);
+  float hi = floor(x / 256.0);
+  return vec4(hi / 255.0, (x - hi * 256.0) / 255.0, 0.0, 1.0);
+}`;
+
+const NOISE = `
+float h21(vec2 p){
+  p = fract(p * vec2(234.34, 435.345));
+  p += dot(p, p + 34.23);
+  return fract(p.x * p.y);
+}
+float vno(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i),               h21(i + vec2(1.0, 0.0)), f.x),
+             mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float fbm(vec2 p){ return vno(p) * 0.64 + vno(p * 2.13 + 7.7) * 0.36; }`;
+
+/* shared flow: lamp convection (curl of drifting noise) + tilt + pointer impulses.
+   Impulse strength envelopes are applied CPU-side each frame — the shader just reads
+   strength. type < 0.5 = stir (directional), else press (radial outward). */
+const FLOW = `
+uniform vec4  uImpP[6];   // x, y (world), vx, vy
+uniform vec4  uImpM[6];   // strength, radius, type, unused
+uniform vec2  uTilt, uWorld;
+uniform float uConv, uT;
+vec2 flow(vec2 w){
+  float e = 0.09;
+  vec2 q = w * 2.7 + vec2(uT * 0.031, -uT * 0.024);
+  float a = fbm(q + vec2(0.0, e)) - fbm(q - vec2(0.0, e));
+  float b = fbm(q + vec2(e, 0.0)) - fbm(q - vec2(e, 0.0));
+  vec2 v = vec2(a, -b) * (uConv / (2.0 * e));
+  q = w * 7.9 + vec2(-uT * 0.043, uT * 0.037);
+  a = fbm(q + vec2(0.0, e)) - fbm(q - vec2(0.0, e));
+  b = fbm(q + vec2(e, 0.0)) - fbm(q - vec2(e, 0.0));
+  v += vec2(a, -b) * (uConv * 0.45 / (2.0 * e));
+  v += uTilt;
+  /* the dish is slightly concave: a gentle return flow keeps fluid on the plate */
+  v += (uWorld * 0.5 - w) * 0.0012;
+  for (int i = 0; i < 6; i++){
+    float s = uImpM[i].x;
+    if (s > 0.0001){
+      vec2 d = w - uImpP[i].xy;
+      float r = uImpM[i].y;
+      float g = exp(-dot(d, d) / (r * r));
+      if (uImpM[i].z < 0.5) v += uImpP[i].zw * (g * s);
+      else                  v += (d / (length(d) + 0.004)) * (g * s * 0.55);
+    }
   }
-  resize();
-  window.addEventListener('resize', resize);
+  return v;
+}`;
 
-  function makeShader(type, src) {
-    var s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    return s;
+const DROPS = `
+uniform vec4 uDropP[4];   // x, y (world), radius, strength (0 = inactive)
+uniform vec4 uDropC[4];   // dye rgb, oil amount`;
+
+/* seed: a composed arrangement of oil blobs (never boot onto an empty plate) */
+const FS_SEED_P = PREC + PACK + NOISE + `
+varying vec2 vUv;
+uniform vec2 uWorld;
+uniform float uSeed;
+void main(){
+  /* no oil layer in this variant — pure separated inks, no outlines */
+  gl_FragColor = pk(0.0);
+}`;
+
+const FS_SEED_D = PREC + NOISE + `
+varying vec2 vUv;
+uniform vec2 uWorld;
+uniform float uSeed;
+void main(){
+  vec2 w = vUv * uWorld;
+  /* immiscible marbling, four inks: hard-edged mottled pools, no ambient wash */
+  vec4 d = vec4(0.0);
+  for (int i = 0; i < 12; i++){
+    float fi = float(i);
+    vec2 c;
+    if (i < 4) c = vec2(h21(vec2(fi * 1.7 + uSeed, 2.3)), h21(vec2(4.1, fi * 2.9 + uSeed))) * 0.76 + 0.12;
+    else       c = vec2(h21(vec2(fi * 2.7 + uSeed, 1.1)), h21(vec2(3.7, fi * 3.1 + uSeed + 5.0))) * 0.84 + 0.08;
+    c *= uWorld;
+    float r = 0.13 + 0.15 * h21(vec2(fi * 1.9, uSeed + 9.0));
+    /* mottled interiors — thick ink in the middle, thinner toward the rim */
+    float g = smoothstep(r, r * 0.82, distance(w, c)) * (0.55 + 0.45 * vno(w * 4.3 + fi + uSeed));
+    int ch = i - (i / 4) * 4;
+    if      (ch == 0) d.r = max(d.r, g);
+    else if (ch == 1) d.g = max(d.g, g);
+    else if (ch == 2) d.b = max(d.b, g);
+    else              d.a = max(d.a, g);
   }
-  function makeProgram(vs, fs) {
-    var p = gl.createProgram();
-    gl.attachShader(p, makeShader(gl.VERTEX_SHADER,   vs));
-    gl.attachShader(p, makeShader(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(p);
-    return p;
+  gl_FragColor = clamp(d, 0.0, 1.0);
+}`;
+
+/* phase update: semi-Lagrangian advect (manual bilinear over packed texels — the
+   texture is NEAREST; hi/lo bytes must never be hardware-filtered), light diffusion,
+   then a mild S-curve toward 0/1. */
+const FS_P = PREC + PACK + NOISE + FLOW + DROPS + `
+varying vec2 vUv;
+uniform sampler2D uPTex;
+uniform vec2  uTexel;
+uniform float uDt, uKD, uKS, uVolBias;
+float phiAt(vec2 uv){ return unpk(texture2D(uPTex, uv)); }
+float phiBi(vec2 uv){
+  vec2 p = uv / uTexel - 0.5;
+  vec2 i = floor(p), f = p - i;
+  vec2 b = (i + 0.5) * uTexel;
+  float p00 = phiAt(b);
+  float p10 = phiAt(b + vec2(uTexel.x, 0.0));
+  float p01 = phiAt(b + vec2(0.0, uTexel.y));
+  float p11 = phiAt(b + uTexel);
+  return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+}
+void main(){
+  vec2 w = vUv * uWorld;
+  vec2 v = flow(w);
+  vec2 off = (v / uWorld) * uDt;
+  vec2 lim = uTexel * 3.0;
+  off = clamp(off, -lim, lim);
+  vec2 src = clamp(vUv - off, uTexel * 0.5, 1.0 - uTexel * 0.5);
+  float phi = phiBi(src);
+  float l = phiAt(src - vec2(uTexel.x, 0.0)) + phiAt(src + vec2(uTexel.x, 0.0))
+          + phiAt(src - vec2(0.0, uTexel.y)) + phiAt(src + vec2(0.0, uTexel.y));
+  phi += uKD * (l * 0.25 - phi);
+  /* forced phase separation: uVolBias shifts the unstable equilibrium point */
+  phi += uKS * phi * (1.0 - phi) * (2.0 * phi - 1.0 + uVolBias);
+  gl_FragColor = pk(phi);
+}`;
+
+/* dye update: ink rides the water phase, but the meniscus is a barrier */
+const FS_D = PREC + PACK + NOISE + FLOW + DROPS + `
+varying vec2 vUv;
+uniform sampler2D uDTex, uPTex;
+uniform vec2  uTexel;
+uniform float uDt, uDDiff, uDDecay, uSep, uShp;
+void main(){
+  vec2 w = vUv * uWorld;
+  float phiC = unpk(texture2D(uPTex, vUv));
+  /* ink and oil ride the same flow — any lag makes a ring outrun its own pool */
+  vec2 v = flow(w);
+  vec2 off = (v / uWorld) * uDt;
+  vec2 lim = uTexel * 3.0;
+  off = clamp(off, -lim, lim);
+  vec2 src = clamp(vUv - off, uTexel * 0.5, 1.0 - uTexel * 0.5);
+  vec4 dye = texture2D(uDTex, src);
+  vec4 avg = ( texture2D(uDTex, src - vec2(uTexel.x, 0.0))
+             + texture2D(uDTex, src + vec2(uTexel.x, 0.0))
+             + texture2D(uDTex, src - vec2(0.0, uTexel.y))
+             + texture2D(uDTex, src + vec2(0.0, uTexel.y)) ) * 0.25;
+  /* immiscibility: no diffusion across the meniscus */
+  float iface = phiC * (1.0 - phiC) * 4.0;
+  dye = mix(dye, avg, uDDiff * (1.0 - 0.9 * iface)) * uDDecay;
+  for (int i = 0; i < 4; i++){
+    float s = uDropP[i].w;
+    if (s > 0.0001){
+      vec2 d = w - uDropP[i].xy;
+      float r = uDropP[i].z;
+      /* a drop displaces what was there — it pools its own colour rather than
+         tinting the mix darker */
+      float m = min(s * exp(-dot(d, d) / (r * r)) * 1.4, 1.0);
+      dye = mix(dye, uDropC[i], m);
+    }
+  }
+  /* immiscible inks, four ways: the locally dominant dye starves its rivals so
+     fronts stay crisp — but the winner's own density is left free to vary. */
+  float mx = max(max(dye.r, dye.g), max(dye.b, dye.a));
+  vec4 win = step(mx - 1e-4, dye);
+  dye = mix(dye, dye * win, uSep * step(0.30, mx));
+  /* survival floor only: pools thin toward 0.5 but never dissolve */
+  dye += win * uShp * max(0.5 - dye, vec4(0.0)) * dye * 2.4;
+  gl_FragColor = clamp(dye, 0.0, 1.0);
+}`;
+
+const FS_COPY = PREC + `
+varying vec2 vUv;
+uniform sampler2D uTex;
+void main(){ gl_FragColor = texture2D(uTex, vUv); }`;
+
+/* unpack pass: phi + gradients + film-thickness noise into one LINEAR-filterable
+   texture so the full-res composite stays cheap */
+const FS_PHI8 = PREC + PACK + NOISE + `
+varying vec2 vUv;
+uniform sampler2D uPTex;
+uniform vec2 uTexel, uWorld;
+uniform float uT;
+void main(){
+  float c = unpk(texture2D(uPTex, vUv));
+  float l = unpk(texture2D(uPTex, vUv - vec2(uTexel.x, 0.0)));
+  float r = unpk(texture2D(uPTex, vUv + vec2(uTexel.x, 0.0)));
+  float b = unpk(texture2D(uPTex, vUv - vec2(0.0, uTexel.y)));
+  float t = unpk(texture2D(uPTex, vUv + vec2(0.0, uTexel.y)));
+  vec2 g = vec2(r - l, t - b) * 0.5;
+  float film = vno(vUv * uWorld * 3.1 + uT * 0.021);
+  gl_FragColor = vec4(c, clamp(g * 2.2 + 0.5, 0.0, 1.0), film);
+}`;
+
+/* projector optics: warm lamp through dye (Beer-Lambert), meniscus refraction and
+   rims, thin-film fringes where the oil runs thin, bubbles, dust, focus breathing */
+const FS_COMP = PREC + NOISE + `
+varying vec2 vUv;
+uniform sampler2D uPhi8, uDye;
+uniform vec2  uWorld, uRes;
+uniform vec3  uAb0, uAb1, uAb2, uAb3;
+uniform vec4  uBub[10];      // x, y (world), radius, phase
+uniform float uT, uFlick, uFocus, uCA, uIrid, uGrain, uSeedT, uDpr, uHot;
+void main(){
+  vec2 suv = vUv;
+  vec4 p8 = texture2D(uPhi8, suv);
+  float phi = p8.r;
+  vec2 grad = (p8.gb - 0.5) / 2.2;
+  float gm = length(grad) * 14.0;
+
+  /* meniscus lensing warps the dye behind the oil */
+  vec2 uv2 = suv + grad * 0.55;
+
+  /* focus breathing + edge CA on the dye layer */
+  vec2 fo = vec2(uFocus) / uRes;
+  vec2 rc = suv - 0.5;
+  vec2 ca = rc * uCA * (0.3 + dot(rc * vec2(uWorld.x / uWorld.y, 1.0), rc) * 2.0);
+  vec4 dye = texture2D(uDye, uv2);
+  dye.r = texture2D(uDye, uv2 + ca).r;
+  dye.b = texture2D(uDye, uv2 - ca).b;
+  vec4 dblur = ( texture2D(uDye, uv2 + vec2(fo.x, 0.0))
+               + texture2D(uDye, uv2 - vec2(fo.x, 0.0))
+               + texture2D(uDye, uv2 + vec2(0.0, fo.y))
+               + texture2D(uDye, uv2 - vec2(0.0, fo.y)) ) * 0.25;
+  dye = mix(dye, dblur, 0.55);
+
+  /* the lamp: warm, centre-hot, gently flickering */
+  vec2 hp = (vUv - 0.5) * vec2(uWorld.x / uWorld.y, 1.0);
+  float hot = 1.0 - uHot * smoothstep(0.18, 1.05, length(hp));
+  vec3 lamp = vec3(1.06, 1.02, 0.86) * hot * uFlick;
+
+  /* transmission through the dyes — absorption boosted for deep period colour */
+  vec3 trans = exp(-(dye.r * uAb0 + dye.g * uAb1 + dye.b * uAb2 + dye.a * uAb3) * 1.9
+                   - vec3(0.80, 0.30, 1.10));
+  vec3 col = lamp * trans;
+  /* oil itself carries a faint amber density */
+  col *= mix(vec3(1.0), vec3(1.03, 0.965, 0.875), smoothstep(0.5, 0.9, phi) * 0.9);
+
+  /* thin-film interference where the oil film thins toward its edge */
+  float th = phi * (0.55 + 0.45 * p8.a);
+  float zone = smoothstep(0.04, 0.16, phi) * (1.0 - smoothstep(0.50, 0.85, phi));
+  vec3 irid = 0.5 + 0.5 * cos(th * 30.0 * vec3(1.0, 1.23, 1.51) + vec3(0.0, 1.3, 2.6));
+  col = mix(col, col * (0.55 + irid * 1.05), zone * uIrid);
+
+  /* meniscus: dark line at the steepest gradient, bright refractive rim beside it */
+  float dark = smoothstep(0.25, 0.85, gm);
+  col *= 1.0 - dark * 0.45;
+  float rim = smoothstep(0.18, 0.62, gm) * (1.0 - smoothstep(0.45, 0.85, phi));
+  col += lamp * rim * 0.42 * trans;
+
+  /* bubbles caught in the fluid: dark ring, bright lens centre */
+  vec2 w = vUv * uWorld;
+  for (int i = 0; i < 10; i++){
+    vec2 d = w - uBub[i].xy;
+    float r = length(d) / max(uBub[i].z, 0.001);
+    float ring = smoothstep(0.62, 0.92, r) * (1.0 - smoothstep(0.98, 1.18, r));
+    col *= 1.0 - ring * 0.42;
+    col += lamp * trans * (1.0 - smoothstep(0.0, 0.42, r)) * 0.20;
   }
 
-  var VS = "attribute vec2 a_pos;\nvoid main() { gl_Position = vec4(a_pos, 0.0, 1.0); }";
+  /* dust on the glass */
+  vec2 dp = w * 90.0;
+  vec2 did = floor(dp);
+  float dOn = step(0.9987, h21(did + 4.7));
+  vec2 dc = vec2(h21(did + 11.0), h21(did + 23.0));
+  col *= 1.0 - dOn * smoothstep(0.30, 0.05, length(fract(dp) - dc)) * 0.35;
 
-  // Yellow (#c8950e → 0.784, 0.584, 0.055) and Green (#143e1a → 0.078, 0.243, 0.102)
-  // 5 colour groups: bg, rich-gold, pale-gold, dark-forest, mid-green
-  var FS = [
-    "precision mediump float;",
-    "uniform vec2  u_res;",
-    "uniform float u_bx[25];",
-    "uniform float u_by[25];",
-    "uniform float u_br[25];",
-    "void main() {",
-    "  vec2 uv = vec2(gl_FragCoord.x / u_res.y, gl_FragCoord.y / u_res.y);",
-    "  float f0=0.,f1=0.,f2=0.,f3=0.,f4=0.;",
-    "  { float dx=uv.x-u_bx[0]; float dy=uv.y-u_by[0]; f0+=u_br[0]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[1]; float dy=uv.y-u_by[1]; f0+=u_br[1]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[2]; float dy=uv.y-u_by[2]; f0+=u_br[2]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[3]; float dy=uv.y-u_by[3]; f0+=u_br[3]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[4]; float dy=uv.y-u_by[4]; f0+=u_br[4]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[5]; float dy=uv.y-u_by[5]; f1+=u_br[5]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[6]; float dy=uv.y-u_by[6]; f1+=u_br[6]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[7]; float dy=uv.y-u_by[7]; f1+=u_br[7]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[8]; float dy=uv.y-u_by[8]; f1+=u_br[8]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[9]; float dy=uv.y-u_by[9]; f1+=u_br[9]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[10]; float dy=uv.y-u_by[10]; f2+=u_br[10]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[11]; float dy=uv.y-u_by[11]; f2+=u_br[11]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[12]; float dy=uv.y-u_by[12]; f2+=u_br[12]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[13]; float dy=uv.y-u_by[13]; f2+=u_br[13]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[14]; float dy=uv.y-u_by[14]; f2+=u_br[14]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[15]; float dy=uv.y-u_by[15]; f3+=u_br[15]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[16]; float dy=uv.y-u_by[16]; f3+=u_br[16]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[17]; float dy=uv.y-u_by[17]; f3+=u_br[17]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[18]; float dy=uv.y-u_by[18]; f3+=u_br[18]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[19]; float dy=uv.y-u_by[19]; f3+=u_br[19]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[20]; float dy=uv.y-u_by[20]; f4+=u_br[20]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[21]; float dy=uv.y-u_by[21]; f4+=u_br[21]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[22]; float dy=uv.y-u_by[22]; f4+=u_br[22]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[23]; float dy=uv.y-u_by[23]; f4+=u_br[23]/(dx*dx+dy*dy+0.0002); }",
-    "  { float dx=uv.x-u_bx[24]; float dy=uv.y-u_by[24]; f4+=u_br[24]/(dx*dx+dy*dy+0.0002); }",
-    "  vec3 col = vec3(0.055, 0.145, 0.062);",
-    "  float total = f0+f1+f2+f3+f4;",
-    "  if (total >= 1.0) {",
-    "    float m = f0; col = vec3(0.065, 0.175, 0.075);",
-    "    if (f1 > m) { m=f1; col=vec3(0.784, 0.584, 0.055); }",
-    "    if (f2 > m) { m=f2; col=vec3(0.690, 0.796, 0.659); }",
-    "    if (f3 > m) { m=f3; col=vec3(0.078, 0.243, 0.102); }",
-    "    if (f4 > m) {       col=vec3(0.784, 0.584, 0.055); }",
-    "  }",
-    "  gl_FragColor = vec4(col, 1.0);",
-    "}"
-  ].join("\n");
+  /* grade: exposure up, re-saturate the dye mix, highlights roll to warm cream */
+  float lu = dot(col, vec3(0.299, 0.587, 0.114));
+  col = clamp(mix(vec3(lu), col, 1.18), 0.0, 4.0);
+  col = vec3(1.0) - exp(-col * 2.6);
+  float lum = max(max(col.r, col.g), col.b);
+  col = mix(col, vec3(1.0, 0.968, 0.90) * lum, smoothstep(0.75, 1.0, lum) * 0.55);
+  vec2 vp = (vUv - 0.5 + vec2(0.02, -0.015)) * vec2(uWorld.x / uWorld.y, 1.0);
+  col *= 1.0 - 0.34 * smoothstep(0.34, 1.1, length(vp));
+  vec2 gp = floor(gl_FragCoord.xy / (uDpr * 1.6));
+  float gn = h21(gp + fract(uSeedT * 0.7107) * 61.0) - 0.5;
+  col += gn * uGrain;
 
-  var prog = makeProgram(VS, FS);
+  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
 
-  var buf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER,
-    new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+/* ══ GL PLUMBING ═══════════════════════════════════════════════════════ */
 
-  var aPos = gl.getAttribLocation(prog, 'a_pos');
-  var uRes = gl.getUniformLocation(prog, 'u_res');
-  var uBX  = gl.getUniformLocation(prog, 'u_bx');
-  var uBY  = gl.getUniformLocation(prog, 'u_by');
-  var uBR  = gl.getUniformLocation(prog, 'u_br');
+let W = 1, H = 1, SW = 1, SH = 1, DPR = 1;
+let quality = 1.0;
+let P = [null, null], D = [null, null], PHI8 = null, VOLT = null, pCur = 0, dCur = 0;
+let progSeedP, progSeedD, progP, progD, progPhi8, progComp, progCopy;
+/* oil-volume servo: measured every ~1.5 s from a 48x24 downsample */
+const VOL_TARGET = 0.085;
+let volMean = VOL_TARGET, volBias = 0;
+const volBuf = new Uint8Array(48 * 24 * 4);
+let quadVBO;
+let lost = false;
 
-  var N  = 25;
-  var px = new Float32Array(N);
-  var py = new Float32Array(N);
-  var vx = new Float32Array(N);
-  var vy = new Float32Array(N);
-  var hx = new Float32Array(N);
-  var hy = new Float32Array(N);
-  var br = new Float32Array(N);
-  var ph = new Float32Array(N);
+function shader(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error('shader: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'a');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error('link: ' + gl.getProgramInfoLog(p));
+  const o = {p:p, u:{}};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++){
+    const info = gl.getActiveUniform(p, i);
+    const name = info.name.replace(/\[0\]$/, '');
+    o.u[name] = gl.getUniformLocation(p, info.name);
+  }
+  return o;
+}
+function mkTarget(w, h, filter){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  gl.clearColor(0, 0, 0, 1);
+  gl.viewport(0, 0, w, h);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return {t:t, f:f, w:w, h:h};
+}
+function delTarget(t){
+  if (!t) return;
+  gl.deleteTexture(t.t);
+  gl.deleteFramebuffer(t.f);
+}
+function toFB(t){
+  gl.bindFramebuffer(gl.FRAMEBUFFER, t ? t.f : null);
+  gl.viewport(0, 0, t ? t.w : W, t ? t.h : H);
+}
+function useQuad(o){
+  gl.useProgram(o.p);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+}
+function bindTex(unit, tex, loc){
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(loc, unit);
+}
+function fullQuad(){ gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
 
-  var seed = 43217;
-  function rng() {
-    seed = ((seed * 1664525) + 1013904223) >>> 0;
-    return seed / 4294967296;
+/* sized from the host panel, not the window */
+function sizeFromHost(){
+  const cssW = Math.max(2, host.clientWidth);
+  const cssH = Math.max(2, host.clientHeight);
+  DPR = Math.max(0.5, Math.min(window.devicePixelRatio || 1, 2) * quality);
+  W = Math.max(2, Math.round(cssW * DPR));
+  H = Math.max(2, Math.round(cssH * DPR));
+  const simLong = Math.round(896 * Math.sqrt(quality));
+  const sc = Math.min(1, simLong / Math.max(cssW, cssH));
+  SW = Math.max(16, Math.round(cssW * sc));
+  SH = Math.max(16, Math.round(cssH * sc));
+  cv.width = W; cv.height = H;
+}
+function buildTargets(){
+  worldUpdate();
+  const oldP = P[pCur], oldD = D[dCur];
+  const oldP2 = P[1 - pCur], oldD2 = D[1 - dCur];
+  delTarget(PHI8); delTarget(VOLT);
+  P[0] = mkTarget(SW, SH, gl.NEAREST);   // packed hi/lo — never hardware-filter
+  P[1] = mkTarget(SW, SH, gl.NEAREST);
+  D[0] = mkTarget(SW, SH, gl.LINEAR);
+  D[1] = mkTarget(SW, SH, gl.LINEAR);
+  PHI8 = mkTarget(SW, SH, gl.LINEAR);
+  VOLT = mkTarget(48, 24, gl.NEAREST);
+  pCur = 0; dCur = 0;
+  if (oldP && oldD){
+    /* a resize or quality step must never reset the plate: resample the old
+       state into the new buffers instead of reseeding */
+    useQuad(progCopy);
+    toFB(P[0]);
+    bindTex(0, oldP.t, progCopy.u.uTex);
+    fullQuad();
+    toFB(D[0]);
+    bindTex(0, oldD.t, progCopy.u.uTex);
+    fullQuad();
+    delTarget(oldP); delTarget(oldD); delTarget(oldP2); delTarget(oldD2);
+  } else {
+    delTarget(oldP2); delTarget(oldD2);
+    seed();
+  }
+}
+const WORLD = [1, 1];
+function worldUpdate(){ WORLD[0] = SW / SH; WORLD[1] = 1; }
+
+let seedVal = Math.random() * 100;
+function seed(){
+  worldUpdate();
+  toFB(P[pCur]);
+  useQuad(progSeedP);
+  gl.uniform2f(progSeedP.u.uWorld, WORLD[0], WORLD[1]);
+  gl.uniform1f(progSeedP.u.uSeed, seedVal);
+  fullQuad();
+  toFB(D[dCur]);
+  useQuad(progSeedD);
+  gl.uniform2f(progSeedD.u.uWorld, WORLD[0], WORLD[1]);
+  gl.uniform1f(progSeedD.u.uSeed, seedVal);
+  fullQuad();
+}
+
+function initGL(){
+  progSeedP = program(VS_QUAD, FS_SEED_P);
+  progSeedD = program(VS_QUAD, FS_SEED_D);
+  progP     = program(VS_QUAD, FS_P);
+  progD     = program(VS_QUAD, FS_D);
+  progPhi8  = program(VS_QUAD, FS_PHI8);
+  progComp  = program(VS_QUAD, FS_COMP);
+  progCopy  = program(VS_QUAD, FS_COPY);
+  quadVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.disable(gl.BLEND);
+  buildTargets();
+}
+
+function resize(){
+  sizeFromHost();
+  if (!lost) buildTargets();
+}
+
+/* ══ DYE PALETTES ══════════════════════════════════════════════════════ */
+
+const PALETTES = [
+  /* absorptions solved from the page's own camo shader: mustard #c8950e
+     (the frame) as the accent, with the greens carrying the plate so the
+     no-bleed marbling stays as dark as the animation it replaces */
+  {name:'camo',
+   ab:[[0.02, 0.49, 0.82], [0.23, 0.35, 0.02], [1.56, 1.24, 1.12], [1.82, 1.61, 1.44]]},
+  {name:'fern',
+   ab:[[0.11, 0.58, 0.92], [0.36, 0.46, 0.07], [1.05, 0.93, 0.69], [1.70, 1.47, 1.33]]},
+  {name:'moss',
+   ab:[[0.02, 0.59, 0.94], [0.46, 0.55, 0.17], [1.36, 1.11, 0.92], [1.82, 1.61, 1.44]]},
+  {name:'lichen',
+   ab:[[0.02, 0.38, 0.57], [0.15, 0.28, 0.02], [1.56, 1.24, 1.12], [1.55, 1.38, 1.15]]}
+];
+let palI = 0, palSrc = PALETTES[0].ab, palDst = PALETTES[0].ab, palT = 1, palNext = 16;
+function ss(x){ return x * x * (3 - 2 * x); }
+function palNow(){
+  const t = palT >= 1 ? 1 : ss(palT);
+  const out = [];
+  for (let i = 0; i < 4; i++){
+    out.push([ palSrc[i][0] + (palDst[i][0] - palSrc[i][0]) * t,
+               palSrc[i][1] + (palDst[i][1] - palSrc[i][1]) * t,
+               palSrc[i][2] + (palDst[i][2] - palSrc[i][2]) * t ]);
+  }
+  return out;
+}
+
+/* ══ SIMULATION STATE ══════════════════════════════════════════════════ */
+
+const SIM_DT = 1 / 60;
+let t = 0, acc = 0;
+/* the fluid's overall viscosity feel — lower = heavier, slower glass */
+const SPEED = 0.68;
+const tsAll = (reduced ? 0.35 : 1.0) * SPEED;
+
+/* impulse ring: slot 0 is reserved for autopilot presses, 1..5 cycle for stirs */
+const IMP_N = 6;
+const imps = [];
+for (let i = 0; i < IMP_N; i++) imps.push({x:0, y:0, vx:0, vy:0, born:-9, str:0, rad:0.1, type:0, hold:false});
+let impNext = 1;
+const impP = new Float32Array(IMP_N * 4), impM = new Float32Array(IMP_N * 4);
+
+function addStir(wx, wy, vx, vy, strength, radius){
+  const s = imps[impNext];
+  impNext = 1 + (impNext % (IMP_N - 1));
+  s.x = wx; s.y = wy; s.vx = vx; s.vy = vy;
+  s.born = t; s.str = strength; s.rad = radius; s.type = 0; s.hold = false;
+}
+
+/* drops: dye injections with a short bloom envelope */
+const DROP_N = 4;
+const drops = [];
+for (let i = 0; i < DROP_N; i++) drops.push({x:0, y:0, r:0.05, born:-9, rgb:[0,0,0,0]});
+let dropNext = 0, dyeCycle = 0;
+const dropP = new Float32Array(DROP_N * 4), dropC = new Float32Array(DROP_N * 4);
+
+function addDrop(wx, wy, big, sizeMul){
+  const d = drops[dropNext];
+  dropNext = (dropNext + 1) % DROP_N;
+  d.x = wx; d.y = wy; d.born = t;
+  d.r = (big ? 0.075 : 0.05) * (0.8 + Math.random() * 0.5) * (sizeMul || 1);
+  d.rgb = [0, 0, 0, 0];
+  d.rgb[dyeCycle] = big ? 0.9 : 0.7;
+  dyeCycle = (dyeCycle + 1) % 4;
+}
+
+/* bubbles disabled in this variant (r = 0) but the uniform is still fed */
+const BUB_N = 10;
+const bubs = [];
+function seedBubs(){
+  bubs.length = 0;
+  for (let i = 0; i < BUB_N; i++)
+    bubs.push({x:Math.random() * WORLD[0], y:Math.random(),
+               vx:0, vy:0, r:0, ph:Math.random() * TAU});
+}
+const bubU = new Float32Array(BUB_N * 4);
+
+/* autopilot — as a background it should never fully settle, so the idle
+   threshold is short and it starts already active */
+let idle = 100, autoW = 0, autoPulseNext = 3, autoDropNext = 6;
+let tiltA = Math.random() * TAU;
+
+function stepSim(dt){
+  /* palette morph */
+  palT = Math.min(1, palT + dt / 3.5);
+  palNext -= dt;
+  if (palNext <= 0){
+    palSrc = palNow();
+    palI = (palI + 1) % PALETTES.length;
+    palDst = PALETTES[palI].ab;
+    palT = 0;
+    palNext = 28 + Math.random() * 14;
   }
 
-  for (var i = 0; i < N; i++) {
-    hx[i] = 0.08 + rng() * 0.84;
-    hy[i] = 0.06 + rng() * 0.88;
-    px[i] = hx[i];
-    py[i] = hy[i];
-    ph[i] = rng() * 6.2832;
-    var inGroup = i % 5;
-    if (inGroup < 2) {
-      br[i] = 0.036 + rng() * 0.019;
-    } else if (inGroup < 4) {
-      br[i] = 0.014 + rng() * 0.010;
+  /* idle / autopilot */
+  idle += dt;
+  const aTgt = idle > 5 ? 1 : 0;
+  autoW += (aTgt - autoW) * (1 - Math.exp(-dt * 0.8));
+  if (autoW > 0.4){
+    autoPulseNext -= dt;
+    if (autoPulseNext <= 0){
+      autoPulseNext = 10 + Math.random() * 10;
+      const s = imps[0];
+      s.x = (0.2 + Math.random() * 0.6) * WORLD[0];
+      s.y = 0.2 + Math.random() * 0.6;
+      s.born = t; s.str = 0.055 + Math.random() * 0.04;
+      s.rad = 0.34 + Math.random() * 0.28; s.type = 1; s.hold = false;
+    }
+    autoDropNext -= dt;
+    if (autoDropNext <= 0){
+      autoDropNext = 9 + Math.random() * 8;
+      addDrop((0.15 + Math.random() * 0.7) * WORLD[0], 0.15 + Math.random() * 0.7, false,
+              0.45 + Math.random() * 1.25);
+    }
+  }
+
+  /* impulse envelopes → packed uniforms */
+  for (let i = 0; i < IMP_N; i++){
+    const s = imps[i];
+    let env = 0;
+    if (s.hold){
+      env = Math.min(1, (t - s.born) / 0.8);
     } else {
-      br[i] = 0.004 + rng() * 0.005;
+      const age = t - s.born;
+      env = age < 1.2 ? Math.exp(-age * 4.2) : 0;
+    }
+    impP[i*4]   = s.x;  impP[i*4+1] = s.y;
+    impP[i*4+2] = s.vx; impP[i*4+3] = s.vy;
+    impM[i*4]   = s.str * env;
+    impM[i*4+1] = s.rad;
+    impM[i*4+2] = s.type;
+    impM[i*4+3] = 0;
+  }
+
+  /* drop envelopes: radius blooms out as strength fades */
+  for (let i = 0; i < DROP_N; i++){
+    const d = drops[i];
+    const age = t - d.born;
+    let env = 0, r = d.r;
+    if (age >= 0 && age < 0.9){
+      env = Math.sin(Math.min(1, age / 0.9) * Math.PI);
+      r = d.r * (0.35 + 1.3 * Math.sqrt(age / 0.9));
+    }
+    dropP[i*4] = d.x; dropP[i*4+1] = d.y; dropP[i*4+2] = Math.max(r, 0.001);
+    dropP[i*4+3] = env * 0.16;
+    dropC[i*4] = d.rgb[0]; dropC[i*4+1] = d.rgb[1]; dropC[i*4+2] = d.rgb[2];
+    dropC[i*4+3] = d.rgb[3];
+  }
+
+  /* slow tilt wander */
+  tiltA += dt * 0.05;
+  const tiltX = Math.cos(tiltA) * 0.0022 + Math.cos(tiltA * 0.37 + 2.0) * 0.0013;
+  const tiltY = Math.sin(tiltA * 0.81) * 0.0022;
+  const conv = (0.075 + 0.04 * autoW) * tsAll;
+
+  /* pass 1: phase field */
+  const pNxt = 1 - pCur;
+  toFB(P[pNxt]);
+  useQuad(progP);
+  gl.uniform2f(progP.u.uWorld, WORLD[0], WORLD[1]);
+  gl.uniform2f(progP.u.uTexel, 1 / SW, 1 / SH);
+  gl.uniform1f(progP.u.uDt, dt * tsAll);   // seconds — v is world-units/second
+  gl.uniform1f(progP.u.uKD, 0.06);
+  gl.uniform1f(progP.u.uKS, 0.033);
+  gl.uniform1f(progP.u.uVolBias, volBias);
+  gl.uniform2f(progP.u.uTilt, tiltX, tiltY);
+  gl.uniform1f(progP.u.uConv, conv);
+  gl.uniform1f(progP.u.uT, t);
+  gl.uniform4fv(progP.u.uImpP, impP);
+  gl.uniform4fv(progP.u.uImpM, impM);
+  gl.uniform4fv(progP.u.uDropP, dropP);
+  gl.uniform4fv(progP.u.uDropC, dropC);
+  bindTex(0, P[pCur].t, progP.u.uPTex);
+  fullQuad();
+  pCur = pNxt;
+
+  /* pass 2: dye field */
+  const dNxt = 1 - dCur;
+  toFB(D[dNxt]);
+  useQuad(progD);
+  gl.uniform2f(progD.u.uWorld, WORLD[0], WORLD[1]);
+  gl.uniform2f(progD.u.uTexel, 1 / SW, 1 / SH);
+  gl.uniform1f(progD.u.uDt, dt * tsAll);   // seconds — v is world-units/second
+  gl.uniform1f(progD.u.uDDiff, 0.0);        // immiscible: zero bleed
+  gl.uniform1f(progD.u.uDDecay, 1.0);
+  gl.uniform1f(progD.u.uSep, 0.05);
+  gl.uniform1f(progD.u.uShp, 0.02);
+  gl.uniform2f(progD.u.uTilt, tiltX, tiltY);
+  gl.uniform1f(progD.u.uConv, conv * 0.9);
+  gl.uniform1f(progD.u.uT, t);
+  gl.uniform4fv(progD.u.uImpP, impP);
+  gl.uniform4fv(progD.u.uImpM, impM);
+  gl.uniform4fv(progD.u.uDropP, dropP);
+  gl.uniform4fv(progD.u.uDropC, dropC);
+  bindTex(0, D[dCur].t, progD.u.uDTex);
+  bindTex(1, P[pCur].t, progD.u.uPTex);
+  fullQuad();
+  dCur = dNxt;
+
+  /* bubbles drift */
+  for (let i = 0; i < BUB_N; i++){
+    const b = bubs[i];
+    b.vx += ((Math.random() - 0.5) * 0.004 + tiltX * 0.4 - b.vx * 0.6) * dt;
+    b.vy += ((Math.random() - 0.5) * 0.004 + tiltY * 0.4 - b.vy * 0.6) * dt;
+    b.x += b.vx * dt * tsAll; b.y += b.vy * dt * tsAll;
+    if (b.x < -0.05) b.x = WORLD[0] + 0.04; if (b.x > WORLD[0] + 0.05) b.x = -0.04;
+    if (b.y < -0.05) b.y = 1.04;            if (b.y > 1.05) b.y = -0.04;
+  }
+
+  t += dt;
+}
+
+/* ══ RENDER ════════════════════════════════════════════════════════════ */
+
+function render(){
+  const pal = palNow();
+
+  toFB(PHI8);
+  useQuad(progPhi8);
+  gl.uniform2f(progPhi8.u.uTexel, 1 / SW, 1 / SH);
+  gl.uniform2f(progPhi8.u.uWorld, WORLD[0], WORLD[1]);
+  gl.uniform1f(progPhi8.u.uT, t);
+  bindTex(0, P[pCur].t, progPhi8.u.uPTex);
+  fullQuad();
+
+  /* oil-volume servo: downsample phi and nudge uVolBias toward the target */
+  if (frames % 45 === 0){
+    toFB(VOLT);
+    useQuad(progCopy);
+    bindTex(0, PHI8.t, progCopy.u.uTex);
+    fullQuad();
+    gl.readPixels(0, 0, 48, 24, gl.RGBA, gl.UNSIGNED_BYTE, volBuf);
+    let s = 0;
+    for (let i = 0; i < volBuf.length; i += 4) s += volBuf[i];
+    volMean = s / (48 * 24 * 255);
+    /* smoothed, gentle servo — hard bias swings sweep blob outlines across
+       parked ink with no fluid motion to carry it along */
+    const rawB = Math.max(-0.2, Math.min(0.5, (VOL_TARGET - volMean) * 2));
+    volBias += (rawB - volBias) * 0.25;
+  }
+
+  for (let i = 0; i < BUB_N; i++){
+    bubU[i*4] = bubs[i].x; bubU[i*4+1] = bubs[i].y;
+    bubU[i*4+2] = bubs[i].r; bubU[i*4+3] = bubs[i].ph;
+  }
+  const flick = reduced ? 1
+    : 1 + 0.010 * Math.sin(t * 7.1) + 0.008 * Math.sin(t * 2.31 + 1.2)
+        + 0.007 * (Math.random() - 0.5);
+  const focus = 0.6 + 0.5 * Math.sin(t * 0.11) + 0.25 * Math.sin(t * 0.043 + 2.2);
+
+  toFB(null);
+  useQuad(progComp);
+  gl.uniform2f(progComp.u.uWorld, WORLD[0], WORLD[1]);
+  gl.uniform2f(progComp.u.uRes, W, H);
+  gl.uniform3f(progComp.u.uAb0, pal[0][0], pal[0][1], pal[0][2]);
+  gl.uniform3f(progComp.u.uAb1, pal[1][0], pal[1][1], pal[1][2]);
+  gl.uniform3f(progComp.u.uAb2, pal[2][0], pal[2][1], pal[2][2]);
+  gl.uniform3f(progComp.u.uAb3, pal[3][0], pal[3][1], pal[3][2]);
+  gl.uniform4fv(progComp.u.uBub, bubU);
+  gl.uniform1f(progComp.u.uT, t);
+  gl.uniform1f(progComp.u.uFlick, flick);
+  gl.uniform1f(progComp.u.uFocus, Math.max(0, focus) * DPR * 1.4);
+  gl.uniform1f(progComp.u.uCA, reduced ? 0.0008 : 0.0016);
+  gl.uniform1f(progComp.u.uIrid, 0.7);
+  gl.uniform1f(progComp.u.uGrain, 0.016);
+  gl.uniform1f(progComp.u.uSeedT, Math.floor(t * 24) % 4096);
+  gl.uniform1f(progComp.u.uDpr, DPR);
+  gl.uniform1f(progComp.u.uHot, 0.45);
+  bindTex(0, PHI8.t, progComp.u.uPhi8);
+  bindTex(1, D[dCur].t, progComp.u.uDye);
+  fullQuad();
+}
+
+/* ══ INPUT ═════════════════════════════════════════════════════════════ */
+/* The canvas is pointer-events:none and every listener is on window, reading
+   the pointer against the canvas rect — so the fluid answers through album
+   sleeves, panels and text alike (same trick the Oil Field uses on about).
+   The gestures are chosen so nothing the page needs gets stolen:
+     move            → stir, everywhere
+     short tap        → drop dye, unless the tap landed on a link or a field,
+                        which then behaves normally (navigate / focus)
+     press and hold   → press the glass anywhere, sleeves included, and drop
+                        on release (longer hold = bigger drop); the click that
+                        would have followed is swallowed
+   Form controls are exempt from the hold so typing is never interrupted. */
+
+const HOLD_MS = 420;
+
+function toWorld(cx, cy){
+  const r = cv.getBoundingClientRect();
+  return {x: (cx - r.left) / Math.max(1, r.width) * WORLD[0],
+          y: (1 - (cy - r.top) / Math.max(1, r.height)) * WORLD[1],
+          inside: cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom};
+}
+function hits(el, sel){ return !!(el && el.closest && el.closest(sel)); }
+const FIELD = 'input, textarea, select, label';
+const LINKY = 'a, button, input, textarea, select, label';
+
+let pLastX = 0, pLastY = 0, pLastT = 0, pSeen = false;
+let pDown = false, pId = null, pT0 = 0, pDist = 0, pMoved = false, pHolding = false;
+let swallowClick = false;
+
+function stir(cx, cy, strength, vscale, cap, rad){
+  const w = toWorld(cx, cy);
+  if (!w.inside){ pSeen = false; return; }
+  if (!pSeen){ pSeen = true; pLastX = cx; pLastY = cy; pLastT = t; return; }
+  const dx = cx - pLastX, dy = cy - pLastY;
+  if (Math.abs(dx) + Math.abs(dy) <= 1) return;
+  const dtm = Math.max(1e-3, t - pLastT);
+  const r = cv.getBoundingClientRect();
+  const vx = (dx / Math.max(1, r.width)) * WORLD[0] / dtm;
+  const vy = (-dy / Math.max(1, r.height)) / dtm;
+  const vl = Math.hypot(vx, vy);
+  const cl = vl > cap ? cap / vl : 1;
+  addStir(w.x, w.y, vx * cl * vscale, vy * cl * vscale, strength, rad);
+  pLastX = cx; pLastY = cy; pLastT = t;
+  idle = 0;
+}
+
+function onDown(id, cx, cy, target, stamp){
+  const w = toWorld(cx, cy);
+  if (!w.inside) return;
+  pDown = true; pId = id; pT0 = stamp; pDist = 0; pMoved = false;
+  pSeen = true; pLastX = cx; pLastY = cy; pLastT = t;
+  idle = 0;
+  /* a field keeps its own press; anything else can hold the glass down */
+  pHolding = !hits(target, FIELD);
+  if (pHolding){
+    const s = imps[0];
+    s.x = w.x; s.y = w.y; s.born = t; s.str = 0.10; s.rad = 0.16;
+    s.type = 1; s.hold = true;
+  }
+}
+function onMove(id, cx, cy){
+  if (pDown && id === pId){
+    pDist += Math.abs(cx - pLastX) + Math.abs(cy - pLastY);
+    if (!pMoved && pDist > 10){
+      pMoved = true;
+      if (pHolding){ imps[0].hold = false; imps[0].born = -9; pHolding = false; }
+    }
+    stir(cx, cy, pMoved ? 0.5 : 0.16, pMoved ? 0.28 : 0.12, pMoved ? 0.9 : 0.5,
+         pMoved ? 0.11 : 0.085);
+    if (!pMoved && pHolding){
+      const w = toWorld(cx, cy);
+      imps[0].x = w.x; imps[0].y = w.y;    // press follows small adjustments
+    }
+  } else if (!pDown){
+    stir(cx, cy, 0.16, 0.12, 0.5, 0.085);
+  }
+}
+function onUp(id, cx, cy, target, stamp){
+  if (id !== pId) return;
+  const heldFor = stamp - pT0;
+  if (pHolding){
+    imps[0].hold = false;
+    imps[0].born = t - 1.0;              // let the press die away quickly
+  }
+  const w = toWorld(cx, cy);
+  if (!pMoved && w.inside){
+    const held = heldFor >= HOLD_MS;
+    /* a quick tap on a link or a field belongs to the page, not the fluid */
+    if (held ? pHolding : !hits(target, LINKY)){
+      const mul = 0.7 + 0.9 * Math.min(heldFor, 1400) / 1400;
+      addDrop(w.x, w.y, held, mul);
+      idle = 0;
+      if (held) swallowClick = true;     // the hold was ours: cancel the click
     }
   }
+  pDown = false; pId = null; pMoved = false; pHolding = false;
+}
 
-  var mx = -1, my = -1;
-  function onMove(cx, cy) {
-    var r = canvas.getBoundingClientRect();
-    mx = (cx - r.left) / r.width;
-    my = 1 - (cy - r.top) / r.height;
-  }
-  window.addEventListener('mousemove',  function(e) { onMove(e.clientX, e.clientY); });
-  window.addEventListener('mouseleave', function()  { mx = -1; });
-  window.addEventListener('touchmove',  function(e) {
-    onMove(e.touches[0].clientX, e.touches[0].clientY);
-  }, { passive: true });
-  window.addEventListener('touchend', function() { mx = -1; });
+if (window.PointerEvent){
+  window.addEventListener('pointerdown', e => onDown(e.pointerId, e.clientX, e.clientY, e.target, e.timeStamp), {passive:true});
+  window.addEventListener('pointermove', e => onMove(e.pointerId, e.clientX, e.clientY), {passive:true});
+  window.addEventListener('pointerup', e => onUp(e.pointerId, e.clientX, e.clientY, e.target, e.timeStamp), {passive:true});
+  window.addEventListener('pointercancel', e => { pDown = false; pId = null; pHolding = false; imps[0].hold = false; }, {passive:true});
+} else {
+  window.addEventListener('mousedown', e => onDown('m', e.clientX, e.clientY, e.target, e.timeStamp));
+  window.addEventListener('mousemove', e => onMove('m', e.clientX, e.clientY));
+  window.addEventListener('mouseup', e => onUp('m', e.clientX, e.clientY, e.target, e.timeStamp));
+  window.addEventListener('touchstart', e => {
+    const tt = e.changedTouches[0];
+    onDown(tt.identifier, tt.clientX, tt.clientY, e.target, e.timeStamp);
+  }, {passive:true});
+  window.addEventListener('touchmove', e => {
+    const tt = e.changedTouches[0];
+    onMove(tt.identifier, tt.clientX, tt.clientY);
+  }, {passive:true});
+  window.addEventListener('touchend', e => {
+    const tt = e.changedTouches[0];
+    onUp(tt.identifier, tt.clientX, tt.clientY, e.target, e.timeStamp);
+  }, {passive:true});
+}
+/* capture phase: kill the navigation a long press would otherwise trigger */
+window.addEventListener('click', e => {
+  if (!swallowClick) return;
+  swallowClick = false;
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+/* a long press on a sleeve must not raise the iOS callout or a context menu */
+window.addEventListener('contextmenu', e => {
+  if (toWorld(e.clientX, e.clientY).inside && !hits(e.target, FIELD)) e.preventDefault();
+});
 
-  var DAMP    = 0.9994;
-  var SPRING  = 0.000003;
-  var MOUSE_R = 0.30;
-  var MOUSE_F = 0.0008;
-  var DRIFT   = 0.0000003;
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 120));
 
-  var t0 = performance.now();
+/* ══ CONTEXT LOSS ══════════════════════════════════════════════════════ */
 
-  var pxScaled = new Float32Array(N);
+cv.addEventListener('webglcontextlost', e => {
+  e.preventDefault();
+  lost = true;
+  if (raf){ cancelAnimationFrame(raf); raf = 0; }
+}, false);
+cv.addEventListener('webglcontextrestored', () => {
+  lost = false;
+  P[0] = P[1] = D[0] = D[1] = PHI8 = null;
+  initGL();
+  last = 0; acc = 0;
+  if (!raf && !document.hidden) raf = requestAnimationFrame(loop);
+}, false);
 
-  function update(t) {
-    for (var i = 0; i < N; i++) {
-      vx[i] += (hx[i] - px[i]) * SPRING;
-      vy[i] += (hy[i] - py[i]) * SPRING;
-      vx[i] += Math.sin(t * 0.000130 + ph[i]) * DRIFT;
-      vy[i] += Math.cos(t * 0.000098 + ph[i] + 1.9) * DRIFT;
-      if (mx >= 0) {
-        var dx = px[i] - mx, dy = py[i] - my;
-        var d2 = dx*dx + dy*dy;
-        if (d2 < MOUSE_R * MOUSE_R) {
-          var d = Math.sqrt(d2) + 0.001;
-          var f = (1 - d/MOUSE_R) * (1 - d/MOUSE_R) * MOUSE_F;
-          vx[i] += dx/d * f;
-          vy[i] += dy/d * f;
-        }
-      }
-      vx[i] *= DAMP; vy[i] *= DAMP;
-      px[i] += vx[i]; py[i] += vy[i];
-      var m = 0.04;
-      if (px[i] < m)   { px[i] = m;   vx[i] =  Math.abs(vx[i]) * 0.3; }
-      if (px[i] > 1-m) { px[i] = 1-m; vx[i] = -Math.abs(vx[i]) * 0.3; }
-      if (py[i] < m)   { py[i] = m;   vy[i] =  Math.abs(vy[i]) * 0.3; }
-      if (py[i] > 1-m) { py[i] = 1-m; vy[i] = -Math.abs(vy[i]) * 0.3; }
-    }
-  }
+/* ══ LOOP ══════════════════════════════════════════════════════════════ */
 
-  function render() {
-    update(performance.now() - t0);
-    var aspect = canvas.width / canvas.height;
-    for (var i = 0; i < N; i++) { pxScaled[i] = px[i] * aspect; }
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(prog);
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-    gl.uniform2f(uRes, canvas.width, canvas.height);
-    gl.uniform1fv(uBX, pxScaled);
-    gl.uniform1fv(uBY, py);
-    gl.uniform1fv(uBR, br);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    requestAnimationFrame(render);
-  }
+let raf = 0, last = 0, ftEMA = 16.7, frames = 0, slowRun = 0;
+
+function loop(now){
+  raf = requestAnimationFrame(loop);
+  if (lost) return;
+
+  const dt = Math.min(Math.max((now - (last || now)) / 1000, 0), 0.05);
+  last = now;
+  frames++;
+  /* recover from a zero-size boot once real layout exists */
+  if ((W < 8 || H < 8) && (frames & 63) === 0 && cv.clientWidth > 4) resize();
+
+  ftEMA += ((dt * 1000) - ftEMA) * 0.06;
+  if (frames > 240 && ftEMA > 23.5 && quality > 0.55){
+    slowRun++;
+    if (slowRun > 90){ quality *= 0.8; slowRun = 0; frames = 0; resize(); }
+  } else slowRun = Math.max(0, slowRun - 1);
+
+  acc += dt;
+  let steps = 0;
+  while (acc >= SIM_DT && steps < 4){ stepSim(SIM_DT); acc -= SIM_DT; steps++; }
+  if (steps >= 4) acc = 0;
 
   render();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden){ if (raf){ cancelAnimationFrame(raf); raf = 0; } }
+  else if (!raf && !lost){
+    if (W < 8 || H < 8) resize();
+    last = 0; acc = 0; raf = requestAnimationFrame(loop);
+  }
+});
+
+/* ══ BOOT ══════════════════════════════════════════════════════════════ */
+
+try {
+  sizeFromHost();
+  worldUpdate();
+  initGL();
+  seedBubs();
+  raf = requestAnimationFrame(loop);
+} catch (err) {
+  /* shader/link failure: leave the plain dark panel */
+}
 })();
 </script>
 
