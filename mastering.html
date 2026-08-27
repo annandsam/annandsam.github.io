@@ -809,7 +809,7 @@ const FS_D = PREC + PACK + NOISE + FLOW + DROPS + `
 varying vec2 vUv;
 uniform sampler2D uDTex, uPTex;
 uniform vec2  uTexel;
-uniform float uDt, uDDiff, uDDecay, uSep, uShp;
+uniform float uDt, uDDiff, uDDecay, uSep, uShp, uFloor;
 void main(){
   vec2 w = vUv * uWorld;
   float phiC = unpk(texture2D(uPTex, vUv));
@@ -845,6 +845,23 @@ void main(){
   dye = mix(dye, dye * win, uSep * step(0.30, mx));
   /* survival floor only: pools thin toward 0.5 but never dissolve */
   dye += win * uShp * max(0.5 - dye, vec4(0.0)) * dye * 2.4;
+  /* The plate must never run bare. The multiplicative term above cannot grow
+     ink from zero, so stirring thins the field until the lamp shines through
+     the base tint alone. Top the dominant channel back up so the lamp is
+     always read through colour — this is what lets the base tint stay light
+     enough for the inks to span a wide gamut. */
+  float tot = dye.r + dye.g + dye.b + dye.a;
+  vec4 fill = win;
+  if (mx < 0.02) {
+    /* nothing to favour here: pick from a slow noise field so refilled ground
+       varies instead of flooding to one ink */
+    float n = fbm(w * 1.6 + uT * 0.011) * 3.999;
+    fill = vec4(step(n, 1.0),
+                step(1.0, n) * step(n, 2.0),
+                step(2.0, n) * step(n, 3.0),
+                step(3.0, n));
+  }
+  dye += fill * max(uFloor - tot, 0.0) * 0.03;
   gl_FragColor = clamp(dye, 0.0, 1.0);
 }`;
 
@@ -910,7 +927,7 @@ void main(){
 
   /* transmission through the dyes — absorption boosted for deep period colour */
   vec3 trans = exp(-(dye.r * uAb0 + dye.g * uAb1 + dye.b * uAb2 + dye.a * uAb3) * 1.9
-                   - vec3(0.80, 0.30, 1.10));
+                   - vec3(0.22, 0.20, 0.95));
   vec3 col = lamp * trans;
   /* oil itself carries a faint amber density */
   col *= mix(vec3(1.0), vec3(1.03, 0.965, 0.875), smoothstep(0.5, 0.9, phi) * 0.9);
@@ -1120,16 +1137,18 @@ function resize(){
 /* ══ DYE PALETTES ══════════════════════════════════════════════════════ */
 
 const PALETTES = [
-  /* the page's own camo colours: mustard #c8950e (the frame) as the accent,
-     with the greens carrying the plate */
+  /* the page's camo colours spread across an even value ladder as well as
+     hue: mustard, sage, mid green, shadow green. The old set wasted a
+     channel — its two darks sat at hue 128 and 125, the same colour twice,
+     and mustard/sage collided at luma 0.57 vs 0.63 */
   {name:'camo',
-   ab:[[0.02, 0.42, 0.76], [0.17, 0.28, 0.02], [1.49, 1.17, 1.06], [1.76, 1.54, 1.38]]},
+   ab:[[0.10, 0.35, 0.68], [0.94, 0.67, 0.36], [1.75, 1.11, 0.97], [2.66, 2.06, 1.86]]},
   {name:'fern',
-   ab:[[0.05, 0.52, 0.85], [0.29, 0.40, 0.02], [0.99, 0.86, 0.63], [1.63, 1.41, 1.26]]},
+   ab:[[0.23, 0.44, 0.79], [1.04, 0.76, 0.46], [1.86, 1.21, 1.06], [2.81, 2.18, 1.98]]},
   {name:'moss',
-   ab:[[0.02, 0.52, 0.87], [0.39, 0.49, 0.11], [1.30, 1.04, 0.86], [1.76, 1.54, 1.38]]},
+   ab:[[0.05, 0.31, 0.61], [0.84, 0.58, 0.27], [1.65, 1.01, 0.87], [2.53, 1.95, 1.75]]},
   {name:'lichen',
-   ab:[[0.02, 0.31, 0.51], [0.08, 0.21, 0.02], [1.49, 1.17, 1.06], [1.48, 1.32, 1.08]]}
+   ab:[[0.18, 0.39, 0.69], [0.99, 0.70, 0.42], [1.81, 1.16, 1.01], [2.73, 2.11, 1.91]]}
 ];
 let palI = 0, palSrc = PALETTES[0].ab, palDst = PALETTES[0].ab, palT = 1, palNext = 16;
 function ss(x){ return x * x * (3 - 2 * x); }
@@ -1304,6 +1323,7 @@ function stepSim(dt){
   gl.uniform1f(progD.u.uDDecay, 1.0);
   gl.uniform1f(progD.u.uSep, 0.05);
   gl.uniform1f(progD.u.uShp, 0.02);
+  gl.uniform1f(progD.u.uFloor, 0.55);
   gl.uniform2f(progD.u.uTilt, tiltX, tiltY);
   gl.uniform1f(progD.u.uConv, conv * 0.9);
   gl.uniform1f(progD.u.uT, t);
