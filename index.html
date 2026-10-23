@@ -372,6 +372,19 @@ h1.hero-name {
   .site-wrap{height:calc(100dvh - 12px);}
 }
 </style>
+
+<style>
+/* The marbling is a toy you press on (tap to drop paint, hold to pour), so a
+   press must never start a text selection or raise the iOS callout. Nothing
+   on this page needs selecting; pan-y keeps vertical scrolling native. */
+.hero-left { touch-action: pan-y; }
+.site-wrap, .site-wrap * {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  user-select: none;
+}
+</style>
 </head>
 <body>
 
@@ -478,7 +491,7 @@ const NS = 12;      // stylus tips (a comb is several)
 const NV = 3;       // slow eddies
 const NOPS = 320;   // operations in the opening composition
 const MARG = 0.14;  // world margin round the visible plate; eddies circulate through it
-const REF_CAP = coarse ? 1600 : 2560;
+const REF_CAP = coarse ? 2048 : 2560;   // reference texture's long side, device px
 const MAP_CAP = coarse ? 640 : 1024;
 
 /* ══ SHADERS ═══════════════════════════════════════════════════════════ */
@@ -1083,7 +1096,9 @@ function setDomain(pr){
 function sizeFromHost(){
   const cssW = Math.max(2, host.clientWidth);
   const cssH = Math.max(2, host.clientHeight);
-  DPR = Math.max(0.5, Math.min(window.devicePixelRatio || 1, 2) * quality);
+  /* full density up to 3x: iPhones are 3x, and at 2x the paint is upscaled
+     by half again and its edges go soft */
+  DPR = Math.max(0.5, Math.min(window.devicePixelRatio || 1, 3) * quality);
   W = Math.max(2, Math.round(cssW * DPR));
   H = Math.max(2, Math.round(cssH * DPR));
   const wu = Math.sqrt(cssW * cssH);
@@ -1238,7 +1253,9 @@ const SIM_DT = 1 / 60;
 const FADE_S = 0.5;             // fade-in once the opening is drawn
 const P = {
   speed: reduced ? 0.4 : 1.0,   // overall pace of the bath
-  bootSS: 2,                   // samples a texel for the opening composition
+  /* samples a texel for the opening; at 3x density one is enough and keeps
+     a phone's larger opening as quick as before */
+  bootSS: (window.devicePixelRatio || 1) >= 2.5 ? 1 : 2,
   crisp: 0.25,                  // anti-diffusion per bake, on soft edges only
   autopilot: true,
   manual: false                 // QA: freeze the clock (pump() still steps)
@@ -1995,7 +2012,8 @@ function loop(now){
   if (lost) return;
   /* a background never needs more than about 60 frames a second */
   if (last && now - last < 10.5) return;
-  const dt = Math.min(Math.max((now - (last || now)) / 1000, 0), 0.05);
+  const raw = last ? now - last : 16.7;
+  const dt = Math.min(Math.max(raw / 1000, 0), 0.05);
   last = now;
   frames++;
   /* recover from a zero-size boot once real layout exists */
@@ -2003,11 +2021,17 @@ function loop(now){
 
   if (booting){ bootStep(now); return; }
 
-  ftEMA += ((dt * 1000) - ftEMA) * 0.06;
-  if (frames > 240 && ftEMA > 23.5 && quality > 0.55){
-    slowRun++;
-    if (slowRun > 90){ quality *= 0.8; slowRun = 0; frames = 0; resize(); }
-  } else slowRun = Math.max(0, slowRun - 1);
+  /* Step quality down only when frames are genuinely slow. A steady 30 fps
+     is a cap (iOS Low Power Mode, battery savers), not a struggling GPU —
+     reading it as slow halved the resolution on iPhones within half a
+     minute. Gaps past 90 ms are a throttled background page, not the GPU. */
+  if (raw < 90){
+    ftEMA += (raw - ftEMA) * 0.06;
+    if (frames > 240 && ftEMA > 40 && quality > 0.55){
+      slowRun++;
+      if (slowRun > 90){ quality *= 0.8; slowRun = 0; frames = 0; resize(); }
+    } else slowRun = Math.max(0, slowRun - 1);
+  }
 
   if (!P.manual){
     acc += dt;

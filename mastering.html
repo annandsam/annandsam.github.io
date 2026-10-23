@@ -646,7 +646,7 @@
    a crisp reference image, folded together every few seconds. Drops use
    Jaffer & Lu's marbling map, which squeezes older paint into fine rings and
    veins at any resolution; strokes, combs and eddies are smooth
-   divergence-free flows. The page opens on a composition built from ~100
+   divergence-free flows. The page opens on a composition built from ~230
    exact operations, so it starts already marbled. Colour runs through
    Liquid Light IV's lamp-and-absorption optics, so the palettes are as tuned.
    Source: ~/Development/MarbleBath (engine.js + build.py). */
@@ -669,6 +669,13 @@ const reduceQ = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: 
 const reduced = !!(reduceQ && reduceQ.matches);
 const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
 const TAU = Math.PI * 2;
+/* Up to four inks ride in one RGBA8 texel (three fractions + film thickness,
+   the last ink is whatever is left); a page with more adds a second texel.
+   'flat' optics paint each ink in its exact colour; otherwise colour runs
+   through Liquid Light IV's lamp-and-absorption optics. */
+const FLAT = CFG.optics === 'flat';
+const NINK = FLAT ? CFG.palettes[0].ink.length : 4;
+const MULTI = NINK > 4;
 
 /* The flow map needs float render targets. Without them the plate still
    marbles by drops (those need no map), just without strokes and eddies. */
@@ -682,12 +689,15 @@ const NS = 12;      // stylus tips (a comb is several)
 const NV = 3;       // slow eddies
 const NOPS = 320;   // operations in the opening composition
 const MARG = 0.14;  // world margin round the visible plate; eddies circulate through it
-const REF_CAP = coarse ? 1600 : 2560;
+const REF_CAP = coarse ? 2048 : 2560;   // reference texture's long side, device px
 const MAP_CAP = coarse ? 640 : 1024;
 
 /* ══ SHADERS ═══════════════════════════════════════════════════════════ */
 
 const HDR = `#version 300 es
+#define INKS ${NINK}
+${MULTI ? '#define MULTI 1' : ''}
+${FLAT ? '#define FLAT 1' : ''}
 precision highp float;
 precision highp int;
 precision highp sampler2D;
@@ -737,12 +747,15 @@ float h21(vec2 p){
   return fract(p.x * p.y);
 }`;
 
-/* Paint is stored as three ink fractions plus film thickness; the fourth
-   fraction is whatever is left, so filtering keeps it a true partition. */
+/* Paint is ink fractions plus film thickness: three fractions and the
+   thickness in one texel (a), four more fractions in a second (b) when a page
+   has more than four inks. The last ink is whatever is left, so filtering
+   always keeps the fractions a true partition. */
 const INK = `
-vec3 oneHot(int k){
-  return k == 0 ? vec3(1.0, 0.0, 0.0) : k == 1 ? vec3(0.0, 1.0, 0.0)
-       : k == 2 ? vec3(0.0, 0.0, 1.0) : vec3(0.0);
+void addPaint(inout vec4 acc, inout vec4 accB, float w, int k, float h){
+  bool last = k >= INKS - 1;
+  acc += w * vec4(last ? vec3(0.0) : vec3(equal(ivec3(k), ivec3(0, 1, 2))), h);
+  accB += w * (last ? vec4(0.0) : vec4(equal(ivec4(k), ivec4(3, 4, 5, 6))));
 }
 /* film thickness inside a drop, by when the paint came out: q = 0 is the
    first paint (now riding the rim), q = 1 the last (the centre). Spreading
@@ -816,7 +829,7 @@ const CHAIN = `
 uniform vec4 uDrop[${ND}];    // centre xy (bake space), r² − b² still to push, size scale
 uniform vec4 uDropB[${ND}];   // ink, seed, current radius, unused
 uniform int  uNDrop;
-void undoDrops(inout vec2 p, inout mat2 J, float pxw, inout vec4 acc, inout float rem){
+void undoDrops(inout vec2 p, inout mat2 J, float pxw, inout vec4 acc, inout vec4 accB, inout float rem){
   for (int i = ${ND} - 1; i >= 0; i--){
     if (i >= uNDrop) continue;
     vec4 d = uDrop[i];
@@ -830,7 +843,7 @@ void undoDrops(inout vec2 p, inout mat2 J, float pxw, inout vec4 acc, inout floa
     if (cov > 0.0){
       vec4 e = uDropB[i];
       float rho = sqrt(max(e.z * e.z - dist * dist, 0.0));
-      acc += rem * cov * vec4(oneHot(int(e.x + 0.5)), hDrop(rho / d.w, rh, e.y));
+      addPaint(acc, accB, rem * cov, int(e.x + 0.5), hDrop(rho / d.w, rh, e.y));
       rem *= 1.0 - cov;
     }
     /* carry on from the middle of the pixel's outside part, not its edge */
@@ -862,10 +875,14 @@ uniform sampler2D uOps;      // RGBA32F, two texels per operation, oldest first
 uniform int   uNOps, uGround;
 uniform float uPxW;
 in vec2 vUv;
-out vec4 o;
-vec4 history(vec2 p, float pxw){
+layout(location = 0) out vec4 o;
+#ifdef MULTI
+layout(location = 1) out vec4 o1;
+#endif
+void history(vec2 p, float pxw, out vec4 acc, out vec4 accB){
   mat2 J = mat2(1.0);
-  vec4 acc = vec4(0.0);
+  acc = vec4(0.0);
+  accB = vec4(0.0);
   float rem = 1.0;
   for (int k = uNOps - 1; k >= 0; k--){
     vec4 A = texelFetch(uOps, ivec2(2 * k, 0), 0);
@@ -879,7 +896,7 @@ vec4 history(vec2 p, float pxw){
       float cov = clamp((R - dist) / gpx + 0.5, 0.0, 1.0);
       if (cov > 0.0){
         float rho = sqrt(max(R * R - dist * dist, 0.0));
-        acc += rem * cov * vec4(oneHot(int(B.x + 0.5)), hDrop(rho / R, rh, B.y));
+        addPaint(acc, accB, rem * cov, int(B.x + 0.5), hDrop(rho / R, rh, B.y));
         rem *= 1.0 - cov;
         if (rem < 0.002) break;
       }
@@ -907,8 +924,7 @@ vec4 history(vec2 p, float pxw){
       J = (mat2(1.0) + outerProduct(M, (B.x * B.y / (dl * dl)) * (sd / ad) * N)) * J;
     }
   }
-  if (rem > 0.002) acc += rem * vec4(oneHot(uGround), hGround(p));
-  return acc;
+  if (rem > 0.002) addPaint(acc, accB, rem, uGround, hGround(p));
 }
 /* the analytic edge coverage handles ordinary edges; extra samples average
    rings squeezed thinner than a texel */
@@ -916,16 +932,55 @@ uniform int uSS;
 void main(){
   vec2 q = domW(vUv);
   float e = uPxW;
-  if (uSS <= 1){ o = history(q, e); return; }
-  if (uSS == 2){
-    o = 0.5 * (history(q + vec2(0.25, 0.25) * e, 0.7 * e)
-             + history(q - vec2(0.25, 0.25) * e, 0.7 * e));
-    return;
+  vec4 a = vec4(0.0), b = vec4(0.0), a1, b1;
+  if (uSS <= 1){
+    history(q, e, a, b);
+  } else if (uSS == 2){
+    history(q + vec2(0.25, 0.25) * e, 0.7 * e, a1, b1); a += 0.5 * a1; b += 0.5 * b1;
+    history(q - vec2(0.25, 0.25) * e, 0.7 * e, a1, b1); a += 0.5 * a1; b += 0.5 * b1;
+  } else {
+    history(q + vec2(-0.125, -0.375) * e, 0.5 * e, a1, b1); a += 0.25 * a1; b += 0.25 * b1;
+    history(q + vec2( 0.375, -0.125) * e, 0.5 * e, a1, b1); a += 0.25 * a1; b += 0.25 * b1;
+    history(q + vec2( 0.125,  0.375) * e, 0.5 * e, a1, b1); a += 0.25 * a1; b += 0.25 * b1;
+    history(q + vec2(-0.375,  0.125) * e, 0.5 * e, a1, b1); a += 0.25 * a1; b += 0.25 * b1;
   }
-  o = 0.25 * (history(q + vec2(-0.125, -0.375) * e, 0.5 * e)
-            + history(q + vec2( 0.375, -0.125) * e, 0.5 * e)
-            + history(q + vec2( 0.125,  0.375) * e, 0.5 * e)
-            + history(q + vec2(-0.375,  0.125) * e, 0.5 * e));
+  o = a;
+#ifdef MULTI
+  o1 = b;
+#endif
+}`;
+
+/* Which operation's drop each point of the visible plate ends up inside
+   (65535 = bare ground), point-sampled at low resolution, so the opening's
+   colours can be dealt by how much of each drop is actually seen. */
+const FS_BOOTID = HDR + DOMAIN + `
+uniform sampler2D uOps;
+uniform int uNOps;
+in vec2 vUv;
+out vec4 o;
+void main(){
+  vec2 p = vUv * uVis;
+  int hit = 65535;
+  for (int k = uNOps - 1; k >= 0; k--){
+    vec4 A = texelFetch(uOps, ivec2(2 * k, 0), 0);
+    vec4 B = texelFetch(uOps, ivec2(2 * k + 1, 0), 0);
+    if (A.x < 0.5){
+      vec2 r = p - A.yz;
+      float dd = dot(r, r), R2 = A.w * A.w;
+      if (dd < R2){ hit = k; break; }
+      p = A.yz + r * sqrt(1.0 - R2 / dd);
+    } else if (A.x < 1.5){
+      vec2 r = p - A.yz;
+      float ph = -A.w * exp(-dot(r, r) / (B.x * B.x));
+      float c = cos(ph), s = sin(ph);
+      p = A.yz + mat2(c, s, -s, c) * r;
+    } else {
+      vec2 M = vec2(cos(A.w), sin(A.w)), N = vec2(-M.y, M.x);
+      float sd = dot(p - A.yz, N);
+      p -= M * (B.x * B.y / (sqrt(sd * sd + 2.5e-5) + B.y));
+    }
+  }
+  o = vec4(float(hit & 255) / 255.0, float(hit >> 8) / 255.0, 0.0, 1.0);
 }`;
 
 /* Bake: fold the flow map and the spreading drops into a fresh reference.
@@ -934,12 +989,18 @@ void main(){
    squeezed it (so squeezed veins average instead of breaking into dots). */
 const FS_BAKE = HDR + DOMAIN + NOISE + INK + MAPREAD + CHAIN + `
 uniform sampler2D uRef;
+#ifdef MULTI
+uniform sampler2D uRefB;
+#endif
 uniform float uPxW, uHasMap, uCrisp;
 in vec2 vUv;
-out vec4 o;
-vec4 fetchC(ivec2 c, ivec2 n){ return texelFetch(uRef, clamp(c, ivec2(0), n - 1), 0); }
-vec4 sharp(vec2 uv, out vec4 mn, out vec4 mx){
-  ivec2 n = textureSize(uRef, 0);
+layout(location = 0) out vec4 o;
+#ifdef MULTI
+layout(location = 1) out vec4 o1;
+#endif
+vec4 fetchC(sampler2D tex, ivec2 c, ivec2 n){ return texelFetch(tex, clamp(c, ivec2(0), n - 1), 0); }
+vec4 sharp(sampler2D tex, vec2 uv, out vec4 mn, out vec4 mx){
+  ivec2 n = textureSize(tex, 0);
   vec2 ts = vec2(n);
   vec2 sp = uv * ts;
   vec2 t1 = floor(sp - 0.5) + 0.5;
@@ -950,29 +1011,29 @@ vec4 sharp(vec2 uv, out vec4 mn, out vec4 mx){
   vec2 w3 = f * f * (-0.5 + 0.5 * f);
   vec2 w12 = w1 + w2;
   vec2 t0 = (t1 - 1.0) / ts, t3 = (t1 + 2.0) / ts, t12 = (t1 + w2 / w12) / ts;
-  vec4 c = textureLod(uRef, vec2(t0.x,  t0.y),  0.0) * w0.x  * w0.y
-         + textureLod(uRef, vec2(t12.x, t0.y),  0.0) * w12.x * w0.y
-         + textureLod(uRef, vec2(t3.x,  t0.y),  0.0) * w3.x  * w0.y
-         + textureLod(uRef, vec2(t0.x,  t12.y), 0.0) * w0.x  * w12.y
-         + textureLod(uRef, vec2(t12.x, t12.y), 0.0) * w12.x * w12.y
-         + textureLod(uRef, vec2(t3.x,  t12.y), 0.0) * w3.x  * w12.y
-         + textureLod(uRef, vec2(t0.x,  t3.y),  0.0) * w0.x  * w3.y
-         + textureLod(uRef, vec2(t12.x, t3.y),  0.0) * w12.x * w3.y
-         + textureLod(uRef, vec2(t3.x,  t3.y),  0.0) * w3.x  * w3.y;
+  vec4 c = textureLod(tex, vec2(t0.x,  t0.y),  0.0) * w0.x  * w0.y
+         + textureLod(tex, vec2(t12.x, t0.y),  0.0) * w12.x * w0.y
+         + textureLod(tex, vec2(t3.x,  t0.y),  0.0) * w3.x  * w0.y
+         + textureLod(tex, vec2(t0.x,  t12.y), 0.0) * w0.x  * w12.y
+         + textureLod(tex, vec2(t12.x, t12.y), 0.0) * w12.x * w12.y
+         + textureLod(tex, vec2(t3.x,  t12.y), 0.0) * w3.x  * w12.y
+         + textureLod(tex, vec2(t0.x,  t3.y),  0.0) * w0.x  * w3.y
+         + textureLod(tex, vec2(t12.x, t3.y),  0.0) * w12.x * w3.y
+         + textureLod(tex, vec2(t3.x,  t3.y),  0.0) * w3.x  * w3.y;
   ivec2 b = ivec2(floor(sp - 0.5));
-  vec4 q0 = fetchC(b, n), q1 = fetchC(b + ivec2(1, 0), n);
-  vec4 q2 = fetchC(b + ivec2(0, 1), n), q3 = fetchC(b + ivec2(1, 1), n);
+  vec4 q0 = fetchC(tex, b, n), q1 = fetchC(tex, b + ivec2(1, 0), n);
+  vec4 q2 = fetchC(tex, b + ivec2(0, 1), n), q3 = fetchC(tex, b + ivec2(1, 1), n);
   mn = min(min(q0, q1), min(q2, q3));
   mx = max(max(q0, q1), max(q2, q3));
   return clamp(c, mn, mx);
 }
-vec4 sharp(vec2 uv){ vec4 mn, mx; return sharp(uv, mn, mx); }
+vec4 sharp(sampler2D tex, vec2 uv){ vec4 mn, mx; return sharp(tex, uv, mn, mx); }
 /* Area-preserving flow squeezes paint one way while stretching it the other,
    so between bakes nearly every texel's footprint is a little long in one
    direction. Averaging a few sharp taps along that long axis keeps edges
    crisp bake after bake; only hard-squeezed paint (veins) goes to the mips. */
-vec4 bakeSample(vec2 uv, vec2 gx, vec2 gy){
-  vec2 ts = vec2(textureSize(uRef, 0));
+vec4 bakeSample(sampler2D tex, vec2 uv, vec2 gx, vec2 gy, vec4 frac){
+  vec2 ts = vec2(textureSize(tex, 0));
   vec2 ax = gx * ts, ay = gy * ts;            // footprint axes, in texels
   float m11 = ax.x * ax.x + ay.x * ay.x;
   float m22 = ax.y * ax.y + ay.y * ay.y;
@@ -986,17 +1047,17 @@ vec4 bakeSample(vec2 uv, vec2 gx, vec2 gy){
        inside the local min/max so it can never invent paint or thicken a
        thin vein, lets such edges slowly settle crisp again. */
     vec4 mn, mx;
-    vec4 c = sharp(uv, mn, mx);
+    vec4 c = sharp(tex, uv, mn, mx);
     vec2 tx = 1.0 / ts;
-    vec4 nb = 0.25 * (textureLod(uRef, uv + vec2(tx.x, 0.0), 0.0) + textureLod(uRef, uv - vec2(tx.x, 0.0), 0.0)
-                    + textureLod(uRef, uv + vec2(0.0, tx.y), 0.0) + textureLod(uRef, uv - vec2(0.0, tx.y), 0.0));
+    vec4 nb = 0.25 * (textureLod(tex, uv + vec2(tx.x, 0.0), 0.0) + textureLod(tex, uv - vec2(tx.x, 0.0), 0.0)
+                    + textureLod(tex, uv + vec2(0.0, tx.y), 0.0) + textureLod(tex, uv - vec2(0.0, tx.y), 0.0));
     /* only on edges that have gone soft: crisp ones are left alone, or they
-       would be pushed into one-texel stairs */
-    vec3 soft = 1.0 - smoothstep(0.3, 0.7, mx.xyz - mn.xyz);
-    c.xyz = clamp(c.xyz + uCrisp * soft * (c.xyz - nb.xyz), mn.xyz, mx.xyz);
-    return c;
+       would be pushed into one-texel stairs; only fraction channels (frac),
+       never the thickness */
+    vec4 soft = 1.0 - smoothstep(0.3, 0.7, mx - mn);
+    return mix(c, clamp(c + uCrisp * soft * (c - nb), mn, mx), frac);
   }
-  if (fmaj > 6.0) return textureGrad(uRef, uv, gx, gy);
+  if (fmaj > 6.0) return textureGrad(tex, uv, gx, gy);
   vec2 v = abs(m12) > 1e-9 ? normalize(vec2(l1 - m22, m12))
                            : (m11 >= m22 ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
   vec2 span = v * fmaj / ts;
@@ -1004,23 +1065,31 @@ vec4 bakeSample(vec2 uv, vec2 gx, vec2 gy){
   vec4 sum = vec4(0.0);
   for (int i = 0; i < 6; i++){
     if (i >= n) break;
-    sum += sharp(uv + span * ((float(i) + 0.5) / float(n) - 0.5));
+    sum += sharp(tex, uv + span * ((float(i) + 0.5) / float(n) - 0.5));
   }
   return sum / float(n);
 }
 void main(){
   vec2 p = domW(vUv) + mapAt(vUv) * uHasMap;
   mat2 J = mat2(dFdx(p), dFdy(p)) / uPxW;
-  vec4 acc = vec4(0.0);
+  vec4 acc = vec4(0.0), accB = vec4(0.0);
   float rem = 1.0;
-  undoDrops(p, J, uPxW, acc, rem);
-  vec4 s = vec4(0.0);
-  if (rem > 1e-4)
-    s = bakeSample(domUV(p), J * vec2(uPxW, 0.0) / uDom, J * vec2(0.0, uPxW) / uDom);
-  vec4 F = acc + rem * s;
-  float t3 = F.x + F.y + F.z;
-  if (t3 > 1.0) F.xyz /= t3;
+  undoDrops(p, J, uPxW, acc, accB, rem);
+  vec4 s = vec4(0.0), sB = vec4(0.0);
+  if (rem > 1e-4){
+    vec2 uv = domUV(p), gx = J * vec2(uPxW, 0.0) / uDom, gy = J * vec2(0.0, uPxW) / uDom;
+    s = bakeSample(uRef, uv, gx, gy, vec4(1.0, 1.0, 1.0, 0.0));
+#ifdef MULTI
+    sB = bakeSample(uRefB, uv, gx, gy, vec4(1.0));
+#endif
+  }
+  vec4 F = acc + rem * s, FB = accB + rem * sB;
+  float tot = F.x + F.y + F.z + FB.x + FB.y + FB.z + FB.w;
+  if (tot > 1.0){ F.xyz /= tot; FB /= tot; }
   o = F;
+#ifdef MULTI
+  o1 = FB;
+#endif
 }`;
 
 /* Composite. The colour path is Liquid Light IV's optics unchanged — a warm
@@ -1029,27 +1098,49 @@ void main(){
    transmitted light, as a lens would. */
 const FS_COMP = HDR + DOMAIN + NOISE + INK + MAPREAD + CHAIN + `
 uniform sampler2D uRef;
+#ifdef MULTI
+uniform sampler2D uRefB;
+#endif
 uniform float uPxW, uHasMap;
 uniform vec3  uAb0, uAb1, uAb2, uAb3, uLamp, uBase, uPlate;
-uniform float uHot, uVig, uCreamLo, uCreamAmt, uGrain, uSeedT, uDpr, uFade;
+uniform vec3  uInk[8];        // flat optics: each ink's colour, linear light
+uniform float uHot, uVig, uCreamLo, uCreamAmt, uGrain, uSeedT, uDpr, uFade, uShade;
 in vec2 vUv;
 out vec4 o;
 void main(){
   vec2 w = vUv * uVis;
   vec2 p = w + mapAt(domUV(w)) * uHasMap;
   mat2 J = mat2(dFdx(p), dFdy(p)) / uPxW;
-  vec4 acc = vec4(0.0);
+  vec4 acc = vec4(0.0), accB = vec4(0.0);
   float rem = 1.0;
-  undoDrops(p, J, uPxW, acc, rem);
-  vec4 s = vec4(0.0);
-  if (rem > 1e-4)
-    s = textureGrad(uRef, domUV(p), J * vec2(uPxW, 0.0) / uDom, J * vec2(0.0, uPxW) / uDom);
-  vec4 F = acc + rem * s;
-  vec4 f = vec4(F.xyz, max(1.0 - F.x - F.y - F.z, 0.0));
-  float dens = 0.75 * (0.5 + F.w);
-
+  undoDrops(p, J, uPxW, acc, accB, rem);
+  vec4 s = vec4(0.0), sB = vec4(0.0);
+  if (rem > 1e-4){
+    vec2 uv = domUV(p), gx = J * vec2(uPxW, 0.0) / uDom, gy = J * vec2(0.0, uPxW) / uDom;
+    s = textureGrad(uRef, uv, gx, gy);
+#ifdef MULTI
+    sB = textureGrad(uRefB, uv, gx, gy);
+#endif
+  }
+  vec4 F = acc + rem * s, FB = accB + rem * sB;
+  float rest = max(1.0 - F.x - F.y - F.z - FB.x - FB.y - FB.z - FB.w, 0.0);
   vec2 hp = (vUv - 0.5) * vec2(uVis.x / uVis.y, 1.0);
   float hot = 1.0 - uHot * smoothstep(0.18, 1.05, length(hp));
+  vec2 vp = (vUv - 0.5 + vec2(0.02, -0.015)) * vec2(uVis.x / uVis.y, 1.0);
+#ifdef FLAT
+  /* each ink in its own flat colour, mixed by coverage in linear light (as
+     an eye would average a filament finer than a pixel); a thicker film
+     reads a touch deeper, a thinner one a touch lighter */
+  vec3 lin = F.x * uInk[0] + F.y * uInk[1] + F.z * uInk[2]
+           + FB.x * uInk[3] + FB.y * uInk[4] + FB.z * uInk[5] + FB.w * uInk[6]
+           + rest * uInk[INKS - 1];
+  lin *= exp(-uShade * (F.w - 0.5)) * hot;
+  lin *= 1.0 - uVig * smoothstep(0.34, 1.1, length(vp));
+  vec3 col = mix(lin * 12.92, 1.055 * pow(lin, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, lin));
+#else
+  vec4 f = vec4(F.xyz, rest);
+  float dens = 0.75 * (0.5 + F.w);
+
   vec3 lamp = uLamp * hot;
   float k = dens * 1.9;
   vec3 trans = (f.x * exp(-k * uAb0) + f.y * exp(-k * uAb1)
@@ -1060,8 +1151,8 @@ void main(){
   col = vec3(1.0) - exp(-col * 2.6);
   float lum = max(max(col.r, col.g), col.b);
   col = mix(col, vec3(1.0, 0.968, 0.90) * lum, smoothstep(uCreamLo, 1.0, lum) * uCreamAmt);
-  vec2 vp = (vUv - 0.5 + vec2(0.02, -0.015)) * vec2(uVis.x / uVis.y, 1.0);
   col *= 1.0 - uVig * smoothstep(0.34, 1.1, length(vp));
+#endif
   vec2 gp = floor(gl_FragCoord.xy / (uDpr * 1.6));
   col += (h21(gp + fract(uSeedT * 0.7107) * 61.0) - 0.5) * uGrain;
   col = mix(uPlate, col, uFade);
@@ -1071,8 +1162,17 @@ void main(){
 const FS_COPY = HDR + `
 uniform sampler2D uTex;
 in vec2 vUv;
-out vec4 o;
-void main(){ o = textureLod(uTex, vUv, 0.0); }`;
+layout(location = 0) out vec4 o;
+#ifdef MULTI
+uniform sampler2D uTexB;
+layout(location = 1) out vec4 o1;
+#endif
+void main(){
+  o = textureLod(uTex, vUv, 0.0);
+#ifdef MULTI
+  o1 = textureLod(uTexB, vUv, 0.0);
+#endif
+}`;
 
 /* ══ GL PLUMBING ═══════════════════════════════════════════════════════ */
 
@@ -1081,7 +1181,7 @@ let VX = 1, VY = 1, DX = 1, DY = 1;   // visible plate and whole domain, world u
 let RW = 2, RH = 2, MW = 2, MH = 2;   // reference and flow-map texture sizes
 let REF = [null, null], refCur = 0, MAP = [null, null], mapCur = 0;
 let OPS = null, ZERO = null, vao = null, hasMap = false, lost = false;
-let progBoot, progMap, progBake, progComp, progCopy;
+let progBoot, progMap, progBake, progComp, progCopy, progBootId = null;
 
 function shader(type, src){
   const s = gl.createShader(type);
@@ -1108,8 +1208,23 @@ function program(fs){
 }
 function L(pr, n){ const l = pr.u[n]; return l === undefined ? null : l; }
 
-/* reference: RGBA8 ink fractions + thickness, mipmapped for squeezed paint */
+/* reference: RGBA8 ink fractions + thickness (and a second texture of four
+   more fractions on a page with more than four inks), mipmapped for
+   squeezed paint, both written at once through one framebuffer */
 function mkRef(w, h){
+  const t = mkRefTex(w, h), tB = MULTI ? mkRefTex(w, h) : null;
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  if (tB){
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, tB, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  }
+  const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return {t:t, tB:tB, f:f, w:w, h:h, ok:ok};
+}
+function mkRefTex(w, h){
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.texStorage2D(gl.TEXTURE_2D, 1 + Math.floor(Math.log2(Math.max(w, h))), gl.RGBA8, w, h);
@@ -1119,7 +1234,7 @@ function mkRef(w, h){
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.MIRRORED_REPEAT);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.MIRRORED_REPEAT);
   if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(16, maxAniso));
-  return withFB(t, w, h);
+  return t;
 }
 function mkMap(w, h){
   const t = gl.createTexture();
@@ -1142,6 +1257,7 @@ function withFB(t, w, h){
 function delTarget(x){
   if (!x) return;
   gl.deleteTexture(x.t);
+  if (x.tB) gl.deleteTexture(x.tB);
   gl.deleteFramebuffer(x.f);
 }
 function toFB(x){
@@ -1160,6 +1276,7 @@ function draw(){
 function mipmap(x){
   gl.bindTexture(gl.TEXTURE_2D, x.t);
   gl.generateMipmap(gl.TEXTURE_2D);
+  if (x.tB){ gl.bindTexture(gl.TEXTURE_2D, x.tB); gl.generateMipmap(gl.TEXTURE_2D); }
 }
 const ZERO4 = new Float32Array(4);
 function clearMap(){
@@ -1177,7 +1294,9 @@ function setDomain(pr){
 function sizeFromHost(){
   const cssW = Math.max(2, host.clientWidth);
   const cssH = Math.max(2, host.clientHeight);
-  DPR = Math.max(0.5, Math.min(window.devicePixelRatio || 1, 2) * quality);
+  /* full density up to 3x: iPhones are 3x, and at 2x the paint is upscaled
+     by half again and its edges go soft */
+  DPR = Math.max(0.5, Math.min(window.devicePixelRatio || 1, 3) * quality);
   W = Math.max(2, Math.round(cssW * DPR));
   H = Math.max(2, Math.round(cssH * DPR));
   const wu = Math.sqrt(cssW * cssH);
@@ -1212,6 +1331,7 @@ function buildTargets(){
     toFB(REF[0]);
     gl.useProgram(progCopy.p);
     bindTex(0, old.t, L(progCopy, 'uTex'));
+    if (MULTI) bindTex(1, old.tB, L(progCopy, 'uTexB'));
     draw();
     mipmap(REF[0]);
     delTarget(old); delTarget(spare);
@@ -1227,6 +1347,7 @@ function initGL(){
   progBake = program(FS_BAKE);
   progComp = program(FS_COMP);
   progCopy = program(FS_COPY);
+  if (CFG.deal) progBootId = program(FS_BOOTID);
   vao = gl.createVertexArray();
   gl.bindVertexArray(vao);
   const vbo = gl.createBuffer();
@@ -1255,22 +1376,30 @@ function initGL(){
 /* ══ PALETTES ══════════════════════════════════════════════════════════ */
 
 const PALETTES = CFG.palettes;
+function hexLin(h){
+  return [1, 3, 5].map(i => {
+    const v = parseInt(h.slice(i, i + 2), 16) / 255;
+    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+}
+const SETS = PALETTES.map(pl => FLAT ? pl.ink.map(hexLin) : pl.ab);
+const inkU = new Float32Array(8 * 3);
 const PLATE = [parseInt(CFG.plate.slice(1, 3), 16) / 255,
                parseInt(CFG.plate.slice(3, 5), 16) / 255,
                parseInt(CFG.plate.slice(5, 7), 16) / 255];
-let palI = 0, palSrc = PALETTES[0].ab, palDst = PALETTES[0].ab, palT = 1, palNext = 16;
+let palI = 0, palSrc = SETS[0], palDst = SETS[0], palT = 1, palNext = 16;
 function ss(x){ return x * x * (3 - 2 * x); }
 function palNow(){
   const k = palT >= 1 ? 1 : ss(palT);
   const out = [];
-  for (let i = 0; i < 4; i++){
+  for (let i = 0; i < palSrc.length; i++){
     out.push([ palSrc[i][0] + (palDst[i][0] - palSrc[i][0]) * k,
                palSrc[i][1] + (palDst[i][1] - palSrc[i][1]) * k,
                palSrc[i][2] + (palDst[i][2] - palSrc[i][2]) * k ]);
   }
   return out;
 }
-const shareSum = CFG.share[0] + CFG.share[1] + CFG.share[2] + CFG.share[3];
+const shareSum = CFG.share.reduce((a, b) => a + b, 0);
 let lastInk = -1;
 function pickInk(avoid, rnd){
   rnd = rnd || Math.random;
@@ -1278,11 +1407,35 @@ function pickInk(avoid, rnd){
   for (let tries = 0; tries < 6; tries++){
     let x = rnd() * shareSum;
     k = 0;
-    while (k < 3 && x >= CFG.share[k]){ x -= CFG.share[k]; k++; }
+    while (k < NINK - 1 && x >= CFG.share[k]){ x -= CFG.share[k]; k++; }
     if (k !== avoid) break;
   }
   return k;
 }
+/* Dealing (CFG.deal): rather than drawing each drop's ink at random, give it
+   to the ink furthest behind its share of the paint so far, with a little
+   chance mixed in so the order never shows. Random draws can let one colour
+   take a whole opening (measured on the homepage: green anywhere from 6% to
+   39% of the plate). memory < 1 lets old drops fade from the tally. */
+function dealer(rnd, memory){
+  const got = new Float64Array(NINK);
+  return function(r, avoid){
+    const a = Math.PI * r * r;
+    let tot = a;
+    for (let k = 0; k < NINK; k++) tot += got[k];
+    let best = 0, bd = -Infinity;
+    for (let k = 0; k < NINK; k++){
+      if (k === avoid) continue;
+      const want = CFG.share[k] / shareSum * tot - got[k] + rnd() * a;
+      if (want > bd){ bd = want; best = k; }
+    }
+    if (memory) for (let k = 0; k < NINK; k++) got[k] *= memory;
+    got[best] += a;
+    return best;
+  };
+}
+const liveDeal = CFG.deal ? dealer(Math.random, 0.97) : null;
+function liveInk(r, avoid){ return liveDeal ? liveDeal(r, avoid) : pickInk(avoid); }
 function mulberry(a){
   return function(){
     a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -1298,7 +1451,9 @@ const SIM_DT = 1 / 60;
 const FADE_S = 0.5;             // fade-in once the opening is drawn
 const P = {
   speed: reduced ? 0.4 : 1.0,   // overall pace of the bath
-  bootSS: 2,                   // samples a texel for the opening composition
+  /* samples a texel for the opening; at 3x density one is enough and keeps
+     a phone's larger opening as quick as before */
+  bootSS: (window.devicePixelRatio || 1) >= 2.5 ? 1 : 2,
   crisp: 0.25,                  // anti-diffusion per bake, on soft edges only
   autopilot: true,
   manual: false                 // QA: freeze the clock (pump() still steps)
@@ -1447,6 +1602,7 @@ function bake(){
   gl.uniform1f(L(progBake, 'uCrisp'), P.crisp);
   bindTex(0, hasMap ? MAP[mapCur].t : ZERO, L(progBake, 'uMap'));
   bindTex(1, src.t, L(progBake, 'uRef'));
+  if (MULTI) bindTex(2, src.tB, L(progBake, 'uRefB'));
   draw();
   mipmap(dst);
   refCur = 1 - refCur;
@@ -1479,6 +1635,7 @@ function stepMap(dt){
    paint, two drops dropped into drops, one pass of a rake, the eddies'
    first turns, then fresh drops and specks on top. */
 const opsBuf = new Float32Array(NOPS * 8);
+const opFree = new Uint8Array(NOPS);    // drops whose colour the balancing may change
 let bootN = 0, bootRow = 0, bootBand = 64, bootLast = 0, booting = false;
 function composeBoot(rnd){
   let n = 0;
@@ -1487,22 +1644,29 @@ function composeBoot(rnd){
     opsBuf.set([a, b, c, d, e, f, 0, 0], n * 8);
     n++;
   };
-  const drop = (x, y, r, ink) => op(0, x, y, r, ink, rnd() * 10);
+  const drop = (x, y, r, ink, free) => {
+    if (n < NOPS) opFree[n] = free ? 1 : 0;
+    op(0, x, y, r, ink, rnd() * 10);
+  };
   const rx = () => -MARG + rnd() * DX, ry = () => -MARG + rnd() * DY;
   const area = DX * DY;
   let ink = -1, cov = 0;
-  const lay = (upto, rMin, rSpan, vein) => {
+  const dealt = CFG.deal ? [dealer(rnd), dealer(rnd), dealer(rnd), dealer(rnd)] : null;
+  const lay = (upto, rMin, rSpan, vein, layer) => {
     while (cov < upto * area && n < NOPS - 48){
       const r = rMin + rSpan * rnd();
-      ink = rnd() < vein ? CFG.ground : pickInk(ink, rnd);
-      drop(rx(), ry(), r, ink);
+      const veinDrop = rnd() < vein;
+      ink = veinDrop ? CFG.ground : dealt ? dealt[layer](r, -1) : pickInk(ink, rnd);
+      drop(rx(), ry(), r, ink, !veinDrop);
       cov += Math.PI * r * r;
     }
   };
-  /* the first colour down is mostly the dark one: it ends up as the veins */
-  lay(0.35, 0.035, 0.03, 0.5);
-  lay(1.85, 0.055, 0.065, 0);
-  lay(2.35, 0.11, 0.06, 0);
+  /* the first colour down is mostly the dark one: it ends up as the veins.
+     A page can ask for less paint (cover) so more of its ground shows. */
+  const cover = CFG.cover || [0.35, 1.85, 2.35];
+  lay(cover[0], 0.035, 0.03, CFG.vein === undefined ? 0.5 : CFG.vein, 0);
+  lay(cover[1], 0.055, 0.065, 0, 1);
+  lay(cover[2], 0.11, 0.06, 0, 2);
   for (let b = 0; b < 2; b++){
     const x = (0.15 + 0.7 * rnd()) * VX, y = (0.15 + 0.7 * rnd()) * VY;
     let r = 0.10 + 0.05 * rnd();
@@ -1517,18 +1681,81 @@ function composeBoot(rnd){
   const fresh = cov + 0.2 * area;
   while (cov < fresh && n < NOPS - 16){
     const r = 0.04 + 0.06 * rnd();
-    ink = pickInk(ink, rnd);
-    drop(rx(), ry(), r, ink);
+    ink = dealt ? dealt[3](r, -1) : pickInk(ink, rnd);
+    drop(rx(), ry(), r, ink, true);
     cov += Math.PI * r * r;
   }
   const nS = Math.round(7 * area);
   for (let i = 0; i < nS; i++) drop(rx(), ry(), 0.004 + 0.008 * rnd(), pickInk(-1, rnd));
   gl.bindTexture(gl.TEXTURE_2D, OPS);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NOPS * 2, 1, gl.RGBA, gl.FLOAT, opsBuf);
+  if (progBootId){
+    balanceOpening(n, rnd);
+    gl.bindTexture(gl.TEXTURE_2D, OPS);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, NOPS * 2, 1, gl.RGBA, gl.FLOAT, opsBuf);
+  }
   bootN = n;
   bootRow = 0;
   booting = true;
 }
+/* Deal the opening's colours by visible area: find how much of the plate
+   each drop ends up covering, then, biggest first, give each free drop an
+   ink still short of its share (chosen at random among those, weighted by
+   how short), so every visit opens near the intended balance without the
+   same colours always landing in the same places. Fixed paint (the ground,
+   veins, bullseyes, specks) counts toward its ink first. */
+function balanceOpening(n, rnd){
+  const iw = 96, ih = Math.max(8, Math.round(96 * VY / VX));
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, iw, ih);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.viewport(0, 0, iw, ih);
+  gl.useProgram(progBootId.p);
+  setDomain(progBootId);
+  gl.uniform1i(L(progBootId, 'uNOps'), n);
+  bindTex(0, OPS, L(progBootId, 'uOps'));
+  draw();
+  const px = new Uint8Array(iw * ih * 4);
+  gl.readPixels(0, 0, iw, ih, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fb);
+  gl.deleteTexture(tex);
+
+  const seen = new Float64Array(n), tally = new Float64Array(NINK);
+  for (let i = 0; i < px.length; i += 4){
+    const k = px[i] | (px[i + 1] << 8);
+    if (k < n) seen[k]++; else tally[CFG.ground]++;
+  }
+  const free = [];
+  for (let k = 0; k < n; k++){
+    if (!seen[k]) continue;
+    if (opsBuf[k * 8] < 0.5 && opFree[k]) free.push(k);
+    else if (opsBuf[k * 8] < 0.5) tally[opsBuf[k * 8 + 4]] += seen[k];
+  }
+  free.sort((a, b) => seen[b] - seen[a]);
+  const total = iw * ih;
+  for (const k of free){
+    const c = seen[k];
+    let sum = 0, best = 0, bestD = -Infinity;
+    const short = new Float64Array(NINK);
+    for (let i = 0; i < NINK; i++){
+      const d = CFG.share[i] / shareSum * total - tally[i];
+      if (d > bestD){ bestD = d; best = i; }
+      if (d >= 0.4 * c){ short[i] = d; sum += d; }
+    }
+    let ink = best;
+    if (sum > 0){
+      let x = rnd() * sum;
+      for (let i = 0; i < NINK; i++){ x -= short[i]; if (short[i] > 0 && x <= 0){ ink = i; break; } }
+    }
+    opsBuf[k * 8 + 4] = ink;
+    tally[ink] += c;
+  }
+}
+
 /* render rows [y0, y1) of the opening; the whole thing is a few hundred
    operations a texel, so on page load it is spread over several frames */
 function bootRows(y0, y1){
@@ -1573,12 +1800,12 @@ function inPlate(m){ return [(m + (1 - 2 * m) * rand()) * VX, (m + (1 - 2 * m) *
 
 function apSingle(){
   const c = inPlate(0.06), R = 0.07 + 0.08 * rand();
-  startDrops([newDrop(c[0], c[1], R, pickInk(lastInk), 0.7 + 7 * R)]);
+  startDrops([newDrop(c[0], c[1], R, liveInk(R, lastInk), 0.7 + 7 * R)]);
 }
 /* drops dropped into a drop: concentric rings */
 function apBullseye(){
   const c = inPlate(0.12), R = 0.10 + 0.07 * rand();
-  const d1 = newDrop(c[0], c[1], R, pickInk(lastInk), 0.7 + 7 * R);
+  const d1 = newDrop(c[0], c[1], R, liveInk(R, lastInk), 0.7 + 7 * R);
   startDrops([d1]);
   let Rk = R, at = t;
   const k = rand() < 0.6 ? 1 : 2;
@@ -1587,7 +1814,7 @@ function apBullseye(){
     at += 0.55 + 0.35 * rand();
     const RR = Rk;
     AP.pending.push({at: at, fn: () =>
-      startDrops([newDrop(d1.cx, d1.cy, RR, pickInk(lastInk), 0.6 + 6 * RR)])});
+      startDrops([newDrop(d1.cx, d1.cy, RR, liveInk(RR, lastInk), 0.6 + 6 * RR)])});
   }
 }
 /* a flick of the brush: a scatter of small drops landing together */
@@ -1599,7 +1826,7 @@ function apSprinkle(){
   for (let i = 0; i < n; i++){
     const a = TAU * rand(), rr = rad * Math.sqrt(rand());
     const R = 0.012 + 0.024 * Math.pow(rand(), 1.5);
-    ink = pickInk(ink);
+    ink = liveInk(R, ink);
     list.push(newDrop(c[0] + Math.cos(a) * rr, c[1] + Math.sin(a) * rr, R, ink, 0.5 + 6 * R));
   }
   startDrops(list);
@@ -1718,7 +1945,7 @@ function stepSim(dt){
   if (palNext <= 0){
     palSrc = palNow();
     palI = (palI + 1) % PALETTES.length;
-    palDst = PALETTES[palI].ab;
+    palDst = SETS[palI];
     palT = 0;
     palNext = 28 + Math.random() * 14;
   }
@@ -1729,7 +1956,7 @@ function stepSim(dt){
   if (pDown && pHolding && !pMoved && !pour && performance.now() - pT0 >= HOLD_MS){
     const w = toWorld(pX, pY);
     if (w.inside){
-      pour = newDrop(w.x, w.y, 0.2, pickInk(lastInk), 1);
+      pour = newDrop(w.x, w.y, 0.2, liveInk(0.12, lastInk), 1);
       pour.hold = true;
       startDrops([pour]);
     }
@@ -1770,18 +1997,26 @@ function render(){
   gl.uniform1f(L(pr, 'uHasMap'), hasMap ? 1 : 0);
   bindTex(0, hasMap ? MAP[mapCur].t : ZERO, L(pr, 'uMap'));
   bindTex(1, REF[refCur].t, L(pr, 'uRef'));
-  gl.uniform3fv(L(pr, 'uAb0'), pal[0]);
-  gl.uniform3fv(L(pr, 'uAb1'), pal[1]);
-  gl.uniform3fv(L(pr, 'uAb2'), pal[2]);
-  gl.uniform3fv(L(pr, 'uAb3'), pal[3]);
-  gl.uniform3fv(L(pr, 'uLamp'), CFG.lamp);
-  gl.uniform3fv(L(pr, 'uBase'), CFG.base);
+  if (MULTI) bindTex(2, REF[refCur].tB, L(pr, 'uRefB'));
+  if (FLAT){
+    inkU.fill(0);
+    for (let i = 0; i < pal.length; i++) inkU.set(pal[i], i * 3);
+    gl.uniform3fv(L(pr, 'uInk'), inkU);
+    gl.uniform1f(L(pr, 'uShade'), CFG.shade);
+  } else {
+    gl.uniform3fv(L(pr, 'uAb0'), pal[0]);
+    gl.uniform3fv(L(pr, 'uAb1'), pal[1]);
+    gl.uniform3fv(L(pr, 'uAb2'), pal[2]);
+    gl.uniform3fv(L(pr, 'uAb3'), pal[3]);
+    gl.uniform3fv(L(pr, 'uLamp'), CFG.lamp);
+    gl.uniform3fv(L(pr, 'uBase'), CFG.base);
+    gl.uniform1f(L(pr, 'uCreamLo'), CFG.creamLo);
+    gl.uniform1f(L(pr, 'uCreamAmt'), CFG.creamAmt);
+  }
   gl.uniform3fv(L(pr, 'uPlate'), PLATE);
   gl.uniform1f(L(pr, 'uHot'), CFG.hot);
   gl.uniform1f(L(pr, 'uVig'), CFG.vig);
-  gl.uniform1f(L(pr, 'uCreamLo'), CFG.creamLo);
-  gl.uniform1f(L(pr, 'uCreamAmt'), CFG.creamAmt);
-  gl.uniform1f(L(pr, 'uGrain'), 0.016);
+  gl.uniform1f(L(pr, 'uGrain'), CFG.grain === undefined ? 0.016 : CFG.grain);
   gl.uniform1f(L(pr, 'uSeedT'), Math.floor(t * 24) % 4096);
   gl.uniform1f(L(pr, 'uDpr'), DPR);
   /* the opening is ready a few hundredths of a second after the page paints,
@@ -1864,7 +2099,7 @@ function onUp(id, cx, cy, target, stamp, lift){
   } else if (!pMoved && w.inside && stamp - pT0 < HOLD_MS && !hits(target, LINKY)){
     /* a quick tap on a link or a field belongs to the page, not the bath */
     const R = 0.045 + 0.03 * Math.random();
-    startDrops([newDrop(w.x, w.y, R, pickInk(lastInk), 0.6 + 6 * R)]);
+    startDrops([newDrop(w.x, w.y, R, liveInk(R, lastInk), 0.6 + 6 * R)]);
   }
   pDown = false; pId = null; pMoved = false; pHolding = false;
 }
@@ -1975,7 +2210,8 @@ function loop(now){
   if (lost) return;
   /* a background never needs more than about 60 frames a second */
   if (last && now - last < 10.5) return;
-  const dt = Math.min(Math.max((now - (last || now)) / 1000, 0), 0.05);
+  const raw = last ? now - last : 16.7;
+  const dt = Math.min(Math.max(raw / 1000, 0), 0.05);
   last = now;
   frames++;
   /* recover from a zero-size boot once real layout exists */
@@ -1983,11 +2219,17 @@ function loop(now){
 
   if (booting){ bootStep(now); return; }
 
-  ftEMA += ((dt * 1000) - ftEMA) * 0.06;
-  if (frames > 240 && ftEMA > 23.5 && quality > 0.55){
-    slowRun++;
-    if (slowRun > 90){ quality *= 0.8; slowRun = 0; frames = 0; resize(); }
-  } else slowRun = Math.max(0, slowRun - 1);
+  /* Step quality down only when frames are genuinely slow. A steady 30 fps
+     is a cap (iOS Low Power Mode, battery savers), not a struggling GPU —
+     reading it as slow halved the resolution on iPhones within half a
+     minute. Gaps past 90 ms are a throttled background page, not the GPU. */
+  if (raw < 90){
+    ftEMA += (raw - ftEMA) * 0.06;
+    if (frames > 240 && ftEMA > 40 && quality > 0.55){
+      slowRun++;
+      if (slowRun > 90){ quality *= 0.8; slowRun = 0; frames = 0; resize(); }
+    } else slowRun = Math.max(0, slowRun - 1);
+  }
 
   if (!P.manual){
     acc += dt;
@@ -2045,11 +2287,11 @@ window.MARBLE = {
   },
   drop(x, y, R, ink){
     R = R || 0.08;
-    startDrops([newDrop(x * VX, y * VY, R, ink === undefined ? pickInk(lastInk) : ink, 0.7 + 7 * R)]);
+    startDrops([newDrop(x * VX, y * VY, R, ink === undefined ? liveInk(R, lastInk) : ink, 0.7 + 7 * R)]);
   },
   stroke(kind){ AP.stroke = makeStroke(kind); return AP.stroke.dur; },
   bake: () => bake(),
-  setPalette(i){ palSrc = palDst = PALETTES[i % PALETTES.length].ab; palI = i; palT = 1; }
+  setPalette(i){ palSrc = palDst = SETS[i % SETS.length]; palI = i; palT = 1; }
 };
 
 try {
