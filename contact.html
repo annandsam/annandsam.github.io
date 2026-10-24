@@ -469,64 +469,7 @@ nav.nav-open .nav-hamburger span:nth-child(3) { transform: translateY(-7px) rota
 
   <div class="page-content">
     <canvas id="marble-canvas"></canvas>
-    <div class="page-wrap">
-      <div class="contact-panel">
-        <h1 class="contact-heading">Contact</h1>
-
-        <div class="contact-form">
-          <div class="field-row">
-            <label for="name">Name</label>
-            <input type="text" id="name" name="name" placeholder="Your name" autocomplete="off">
-          </div>
-          <div class="field-row">
-            <label for="email">Email</label>
-            <input type="email" id="email" name="email" placeholder="your@email.com" autocomplete="off">
-          </div>
-          <div class="field-row">
-            <label for="subject">Subject</label>
-            <input type="text" id="subject" name="subject" autocomplete="off">
-          </div>
-          <div class="field-row">
-            <label for="message">Message</label>
-            <textarea id="message" name="message" placeholder="Your message..."></textarea>
-          </div>
-          <div class="submit-row">
-            <button class="submit-btn" id="submit-btn" type="button">Send message</button>
-          </div>
-          <div class="success-msg" id="success-msg">
-            Message received, I'll be in touch.
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-</div>
-
 <script>
-document.getElementById('submit-btn').addEventListener('click', function() {
-  var name    = document.getElementById('name').value.trim();
-  var email   = document.getElementById('email').value.trim();
-  var subject = document.getElementById('subject').value.trim();
-  var message = document.getElementById('message').value.trim();
-  if (!name || !email || !message) return;
-
-  /* The address is never present in the page as text. It used to sit here as
-     two adjacent plain strings joined with '@', which harvesters lift as
-     readily as a literal — the likeliest source of the junk mail. XOR-encoded
-     and assembled only when someone actually clicks send. */
-  var K = 92;
-  var to = [47,61,49,3,61,50,50,61,50,56,28,52,51,40,49,61,53,48,114,63,51,49].map(function(c) { return String.fromCharCode(c ^ K); }).join('');
-  var body = 'Name: ' + name + '\nEmail: ' + email + '\n\n' + message;
-  var mailtoLink = 'mail' + 'to:' + to
-    + '?subject=' + encodeURIComponent(subject || '(No subject)')
-    + '&body='    + encodeURIComponent(body);
-
-  window.location.href = mailtoLink;
-
-  document.getElementById('success-msg').classList.add('visible');
-});
-
 /* Marbling — background engine (2026-10-23), replacing Liquid Light IV.
    Paint on a marbling bath moves by slow, area-preserving viscous flow, so
    rather than pushing a blurry dye grid around, every pixel looks back along
@@ -540,7 +483,7 @@ document.getElementById('submit-btn').addEventListener('click', function() {
    Source: ~/Development/MarbleBath (engine.js + build.py). */
 (function(){
 'use strict';
-const CFG = {"plate":"#3d1f0a","lamp":[1.1,0.96,0.8],"base":[0.25,0.45,1.25],"hot":0.24,"vig":0.15,"creamLo":0.8,"creamAmt":0.28,"share":[0.14,0.34,0.36,0.16],"ground":3,"palettes":[{"name":"terracotta","ab":[[0.07,0.17,0.39],[0.32,0.85,0.85],[0.73,1.93,1.32],[2.07,2.42,2.14]]},{"name":"kiln","ab":[[0.24,0.32,0.55],[0.5,1.0,1.01],[0.89,2.09,1.47],[2.29,2.65,2.44]]},{"name":"ember","ab":[[0.04,0.11,0.32],[0.19,0.74,0.72],[0.61,1.73,1.2],[1.88,2.16,1.84]]},{"name":"oxide","ab":[[0.15,0.24,0.48],[0.41,0.94,0.94],[0.79,2.02,1.39],[2.16,2.49,2.27]]}]};
+const CFG = {"plate":"#3d1f0a","lamp":[1.1,0.96,0.8],"base":[0.25,0.45,1.25],"hot":0.24,"vig":0.15,"creamLo":0.8,"creamAmt":0.28,"share":[0.14,0.34,0.36,0.16],"ground":3,"instant":true,"fade":0.25,"palettes":[{"name":"terracotta","ab":[[0.07,0.17,0.39],[0.32,0.85,0.85],[0.73,1.93,1.32],[2.07,2.42,2.14]]},{"name":"kiln","ab":[[0.24,0.32,0.55],[0.5,1.0,1.01],[0.89,2.09,1.47],[2.29,2.65,2.44]]},{"name":"ember","ab":[[0.04,0.11,0.32],[0.19,0.74,0.72],[0.61,1.73,1.2],[1.88,2.16,1.84]]},{"name":"oxide","ab":[[0.15,0.24,0.48],[0.41,0.94,0.94],[0.79,2.02,1.39],[2.16,2.49,2.27]]}]};
 const cv = document.getElementById('marble-canvas');
 if (!cv) return;
 
@@ -1336,7 +1279,7 @@ function mulberry(a){
 /* ══ SIMULATION STATE ══════════════════════════════════════════════════ */
 
 const SIM_DT = 1 / 60;
-const FADE_S = 0.5;             // fade-in once the opening is drawn
+const FADE_S = CFG.fade === undefined ? 0.5 : CFG.fade;   // fade-in once the opening is drawn
 const P = {
   speed: reduced ? 0.4 : 1.0,   // overall pace of the bath
   /* samples a texel for the opening; at 3x density one is enough and keeps
@@ -2066,6 +2009,19 @@ window.addEventListener('resize', () => {
   resizeTimer = setTimeout(resize, 120);
 });
 window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+/* The engine now starts early in the page, so its panel can still shift a
+   little afterwards (the nav settles when its web font arrives) without any
+   window resize. Watch the panel itself. */
+if (window.ResizeObserver){
+  let seenSize = host.clientWidth + 'x' + host.clientHeight;
+  new ResizeObserver(() => {
+    const sz = host.clientWidth + 'x' + host.clientHeight;
+    if (sz === seenSize) return;
+    seenSize = sz;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 120);
+  }).observe(host);
+}
 
 /* ══ CONTEXT LOSS ══════════════════════════════════════════════════════ */
 
@@ -2187,6 +2143,9 @@ try {
   initGL();
   TIMING.gl = Math.round(performance.now());
   boot((Math.random() * 4294967296) >>> 0);
+  /* CFG.instant: draw the whole opening now rather than a band a frame, so
+     the page opens on marbling (it is a few tens of ms of GPU work) */
+  if (CFG.instant) bootRows(0, RH);
   render();
   raf = requestAnimationFrame(loop);
 } catch (err) {
@@ -2195,6 +2154,66 @@ try {
   if (window.console) console.warn('marbling:', err && err.message ? err.message : err);
 }
 })();
+</script>
+    <div class="page-wrap">
+      <div class="contact-panel">
+        <h1 class="contact-heading">Contact</h1>
+
+        <div class="contact-form">
+          <div class="field-row">
+            <label for="name">Name</label>
+            <input type="text" id="name" name="name" placeholder="Your name" autocomplete="off">
+          </div>
+          <div class="field-row">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" placeholder="your@email.com" autocomplete="off">
+          </div>
+          <div class="field-row">
+            <label for="subject">Subject</label>
+            <input type="text" id="subject" name="subject" autocomplete="off">
+          </div>
+          <div class="field-row">
+            <label for="message">Message</label>
+            <textarea id="message" name="message" placeholder="Your message..."></textarea>
+          </div>
+          <div class="submit-row">
+            <button class="submit-btn" id="submit-btn" type="button">Send message</button>
+          </div>
+          <div class="success-msg" id="success-msg">
+            Message received, I'll be in touch.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+document.getElementById('submit-btn').addEventListener('click', function() {
+  var name    = document.getElementById('name').value.trim();
+  var email   = document.getElementById('email').value.trim();
+  var subject = document.getElementById('subject').value.trim();
+  var message = document.getElementById('message').value.trim();
+  if (!name || !email || !message) return;
+
+  /* The address is never present in the page as text. It used to sit here as
+     two adjacent plain strings joined with '@', which harvesters lift as
+     readily as a literal — the likeliest source of the junk mail. XOR-encoded
+     and assembled only when someone actually clicks send. */
+  var K = 92;
+  var to = [47,61,49,3,61,50,50,61,50,56,28,52,51,40,49,61,53,48,114,63,51,49].map(function(c) { return String.fromCharCode(c ^ K); }).join('');
+  var body = 'Name: ' + name + '\nEmail: ' + email + '\n\n' + message;
+  var mailtoLink = 'mail' + 'to:' + to
+    + '?subject=' + encodeURIComponent(subject || '(No subject)')
+    + '&body='    + encodeURIComponent(body);
+
+  window.location.href = mailtoLink;
+
+  document.getElementById('success-msg').classList.add('visible');
+});
+
+
 </script>
 
 <script>
